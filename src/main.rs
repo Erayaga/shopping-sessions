@@ -48,6 +48,84 @@ fn hash(b: &[u8]) -> u64 {
     }
 }
 
+/// Key of an ID (user, event): a string of 1..=11 characters from [0-9a-z]
+/// without a leading zero (or exactly "0") is read as a base-36 number and its
+/// key is value + 1 (< 2^57): exact, and the string can be written back from
+/// it. Any other string gets its 64-bit hash with the top bit set, so the two
+/// kinds never collide.
+/// Base-36 digit of each byte, 255 for anything else.
+static B36: [u8; 256] = {
+    let mut t = [255u8; 256];
+    let mut i = 0;
+    while i < 10 {
+        t[b'0' as usize + i] = i as u8;
+        i += 1;
+    }
+    let mut i = 0;
+    while i < 26 {
+        t[b'a' as usize + i] = 10 + i as u8;
+        i += 1;
+    }
+    t
+};
+
+#[inline(always)]
+fn key(b: &[u8]) -> u64 {
+    let n = b.len();
+    if n >= 1 && n <= 11 && (b[0] != b'0' || n == 1) {
+        // fixed 11 steps, selects instead of branches: no mispredicted exit
+        let mut v: u64 = 0;
+        let mut bad = 0u8;
+        let mut buf = [b'0'; 11];
+        buf[..n].copy_from_slice(b);
+        for i in 0..11 {
+            let d = B36[buf[i] as usize];
+            let live = i < n;
+            bad |= if live { d } else { 0 } & 0x80;
+            v = if live { v * 36 + (d & 0x3f) as u64 } else { v };
+        }
+        if bad == 0 {
+            return v + 1;
+        }
+    }
+    hash(b) | (1 << 63)
+}
+
+/// True if a key is an exact (canonical) one.
+#[inline(always)]
+pub fn canonical(k: u64) -> bool {
+    k >> 63 == 0
+}
+
+/// The ID string of a canonical key.
+pub fn write_canonical(out: &mut Vec<u8>, k: u64) {
+    const D: &[u8; 36] = b"0123456789abcdefghijklmnopqrstuvwxyz";
+    let mut v = k - 1;
+    let mut buf = [0u8; 12];
+    let mut at = buf.len();
+    loop {
+        at -= 1;
+        buf[at] = D[(v % 36) as usize];
+        v /= 36;
+        if v == 0 {
+            break;
+        }
+    }
+    out.extend_from_slice(&buf[at..]);
+}
+
+/// Spreads keys (exact keys are not random in any bit range).
+#[inline(always)]
+fn mix(k: u64) -> u64 {
+    k.wrapping_mul(0x9E37_79B9_7F4A_7C15)
+}
+
+/// Slot of key k in a power-of-two table (bits independent of `bucket`'s).
+#[inline(always)]
+fn slot_of(k: u64, mask: usize) -> usize {
+    ((mix(k) >> 20) as usize) & mask
+}
+
 /// The first 8 bytes, big-endian, zero padded: orders IDs byte-wise except
 /// when equal, where the full bytes decide.
 #[inline(always)]
@@ -60,7 +138,7 @@ fn prefix(b: &[u8]) -> u64 {
 
 #[inline(always)]
 fn bucket(h: u64) -> usize {
-    (h >> (64 - BUCKET_BITS)) as usize
+    (mix(h) >> (64 - BUCKET_BITS)) as usize
 }
 
 /// Open addressing: u64 key (a hash, never 0) -> V, keys and values interleaved.
@@ -78,12 +156,12 @@ impl<V: Copy + Default> Table<V> {
     pub fn prefetch(&self, k: u64) {
         #[cfg(target_arch = "x86_64")]
         unsafe {
-            std::arch::x86_64::_mm_prefetch(&self.slots[(k as usize) & self.mask] as *const _ as *const i8, std::arch::x86_64::_MM_HINT_T0);
+            std::arch::x86_64::_mm_prefetch(&self.slots[slot_of(k, self.mask)] as *const _ as *const i8, std::arch::x86_64::_MM_HINT_T0);
         }
     }
     #[inline(always)]
     pub fn get(&self, k: u64) -> Option<V> {
-        let mut i = (k as usize) & self.mask;
+        let mut i = slot_of(k, self.mask);
         loop {
             let s = &self.slots[i];
             if s.0 == k {
@@ -98,7 +176,7 @@ impl<V: Copy + Default> Table<V> {
     /// The slot for `k`, inserting it with V::default() if absent; true if new.
     #[inline(always)]
     pub fn slot(&mut self, k: u64) -> (&mut V, bool) {
-        let mut i = (k as usize) & self.mask;
+        let mut i = slot_of(k, self.mask);
         loop {
             let s = self.slots[i].0;
             if s == k {
@@ -286,7 +364,7 @@ impl LocalSet {
             }
         }
         let mask = self.slots.len() - 1;
-        let mut i = (k as usize) & mask;
+        let mut i = slot_of(k, mask);
         loop {
             let s = self.slots[i];
             if s == k {
@@ -349,7 +427,6 @@ fn bucket_len_v<T>(parts: &[Vec<Vec<T>>], b: usize) -> usize {
 #[derive(Clone, Copy, Default)]
 struct ERec {
     uh: u64,
-    uref: u64,
     ts: u32, // ms since t0 = window_start - 7 days
     pc: u32, // price (24 bits) | category << 24; price 0 = not a purchase
 }
@@ -539,7 +616,7 @@ fn main() {
                         let e = *nedges;
                         *nedges += 1;
                         for side in 0..2 {
-                            let h = hash(f[side]);
+                            let h = key(f[side]);
                             bk[bucket(h)].push((h, corpus.rf(c.file, f[side]), prefix(f[side]), e * 2 + side as u32));
                         }
                     }
@@ -660,7 +737,7 @@ fn main() {
         people
     };
     assert!(threads <= 16, "locations pack the thread into 4 bits");
-    let (people, ep_valid, ep_ids, cp) = std::thread::scope(|scope| {
+    let (people, ep_valid, ep_ids, cp, xp) = std::thread::scope(|scope| {
         let links = scope.spawn(links_job);
         let tids = AtomicUsize::new(0);
         // ================================================================ events: parse
@@ -672,8 +749,8 @@ fn main() {
         let ep = par_fin(
             threads,
             ne_chunks + click_chunks.len(),
-            || (Parts::<ERec>::new(NB), Parts::<DRec>::new(NB), tids.fetch_add(1, Ordering::Relaxed) as u32, Parts::<Ck>::new(NB)),
-            |(uk, dk, tid, bk), i| {
+            || (Parts::<ERec>::new(NB), Parts::<DRec>::new(NB), tids.fetch_add(1, Ordering::Relaxed) as u32, Parts::<Ck>::new(NB), Parts::<(u64, u64)>::new(NB)),
+            |(uk, dk, tid, bk, xk), i| {
                 let ahead = i + LOOKAHEAD;
                 if ahead < ne_chunks {
                     read_ahead(corpus, event_chunks[ahead]);
@@ -693,7 +770,7 @@ fn main() {
                         if ts < t0 || ts >= we {
                             return;
                         }
-                        let uh = hash(f[1]);
+                        let uh = key(f[1]);
                         bk.push(bucket(uh), Ck { key: uh, cid: corpus.rf(c.file, f[0]), ts: (ts - t0) as u32, camp });
                     });
                     return;
@@ -705,7 +782,7 @@ fn main() {
                     if f[0].is_empty() {
                         return;
                     }
-                    let eh = hash(f[0]);
+                    let eh = hash(f[0]); // event_ids are never printed: a hash is enough
                     let ingest_abs = parse::timestamp(f[3]).unwrap_or(i64::MAX);
                     let ingest = ((ingest_abs.saturating_sub(t0)) / 1000).clamp(i32::MIN as i64, i32::MAX as i64) as i32;
                     let valid = (|| {
@@ -729,11 +806,15 @@ fn main() {
                     let loc = match valid {
                         Some((ts, price)) => {
                             let cat = products_lookup(f[5]);
-                            let uh = hash(f[1]);
+                            let uh = key(f[1]);
                             let b = bucket(uh);
                             let idx = uk.segs[b].count();
                             assert!(idx < 1 << 20, "location index overflow");
-                            uk.push(b, ERec { uh, uref: corpus.rf(c.file, f[1]), ts: (ts - t0) as u32, pc: price | (cat << 24) });
+                            uk.push(b, ERec { uh, ts: (ts - t0) as u32, pc: price | (cat << 24) });
+                            if !canonical(uh) {
+                                // its name must come from the text: keep a ref
+                                xk.push(b, (uh, corpus.rf(c.file, f[1])));
+                            }
                             (*tid << 28) | ((b as u32) << 20) | idx as u32
                         }
                         None => NOLOC,
@@ -741,7 +822,8 @@ fn main() {
                     dk.push(bucket(eh), DRec { eh, ingest, loc });
                 });
             },
-            |(uk, dk, _, bk)| {
+            |(uk, dk, _, bk, xk)| {
+                xk.finish();
                 uk.finish();
                 dk.finish();
                 bk.finish();
@@ -753,13 +835,15 @@ fn main() {
         let mut ep_valid = Vec::new();
         let mut ep_ids = Vec::new();
         let mut cp = Vec::new();
-        for (u, d, _, c) in ep {
+        let mut xp = Vec::new();
+        for (u, d, _, c, x) in ep {
             ep_valid.push(u);
             ep_ids.push(d);
             cp.push(c);
+            xp.push(x);
         }
         lap("events and clicks parsed");
-        (links.join().unwrap(), ep_valid, ep_ids, cp)
+        (links.join().unwrap(), ep_valid, ep_ids, cp, xp)
     });
 
     // ================================================================ duplicate event_ids
@@ -779,7 +863,7 @@ fn main() {
         },
         |(out, groups, tab), b| {
             for r in gather(&ep_ids, b) {
-                groups[((r.eh >> 48) & 255) as usize].push(*r);
+                groups[((mix(r.eh) >> 40) & 255) as usize].push(*r);
             }
             for grp in groups.iter_mut() {
                 if grp.len() < 2 {
@@ -847,13 +931,21 @@ fn main() {
                 }
             }
             seen.reset(part_len(&ep_valid, b) / 8);
+            let mut xref: Table<u64> = Table::with_capacity(part_len(&xp, b));
+            for &(k, r) in gather(&xp, b) {
+                xref.insert(k, r);
+            }
             for (t, part) in ep_valid.iter().enumerate() {
                 let bt = &bits[t];
                 for (i, e) in part.segs[b].iter().enumerate() {
                     if bt[i >> 6] & (1 << (i & 63)) != 0 {
                         continue;
                     }
-                    let (key, r) = tab.get(e.uh).unwrap_or((e.uh, e.uref));
+                    let (key, r) = match tab.get(e.uh) {
+                        Some(x) => x,
+                        None if canonical(e.uh) => (e.uh, 0),
+                        None => (e.uh, xref.get(e.uh).expect("ref of a non-canonical user_id")),
+                    };
                     let pb = bucket(key);
                     eo.push(pb, Ev { key, ts: e.ts, pc: e.pc });
                     if seen.insert(key) {
@@ -875,6 +967,7 @@ fn main() {
     drop(ep_valid);
     drop(cp);
     drop(losers);
+    drop(xp);
     let mut ev_parts = Vec::new();
     let mut ck_parts = Vec::new();
     let mut nm_parts = Vec::new();
@@ -1046,7 +1139,7 @@ impl Worker {
         let mut pkeys = std::mem::take(&mut self.pkeys);
         pkeys.clear();
         for &(k, r) in gather(nm_parts, b) {
-            let mut i = (k as usize) & mask;
+            let mut i = slot_of(k, mask);
             loop {
                 let s = ltab[i];
                 if s.0 == k {
@@ -1055,7 +1148,7 @@ impl Worker {
                 if s.0 == 0 {
                     ltab[i] = (k, cnt.len() as u32);
                     cnt.push(0);
-                    pnames.push(r);
+                    pnames.push(if canonical(k) { k } else { r | (1 << 63) });
                     pkeys.push(k);
                     break;
                 }
@@ -1065,7 +1158,7 @@ impl Worker {
         let mut idx = std::mem::take(&mut self.idx);
         idx.clear();
         for e in gather(ev_parts, b) {
-            let mut i = (e.key as usize) & mask;
+            let mut i = slot_of(e.key, mask);
             let li = loop {
                 let s = ltab[i];
                 if s.0 == e.key {
@@ -1104,7 +1197,7 @@ impl Worker {
         ccnt.resize(np + 1, 0);
         idx.clear();
         for c in gather(ck_parts, b) {
-            let mut i = (c.key as usize) & mask;
+            let mut i = slot_of(c.key, mask);
             let li = loop {
                 let s = ltab[i];
                 if s.0 == c.key {
@@ -1161,7 +1254,7 @@ impl Worker {
         }
         // reset the used slots: each person's key is still in its slot
         for &k in &pkeys {
-            let mut i = (k as usize) & mask;
+            let mut i = slot_of(k, mask);
             while ltab[i].0 != k {
                 i = (i + 1) & mask;
             }
@@ -1298,5 +1391,55 @@ impl Worker {
                 k += 1;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod key_tests {
+    use super::*;
+
+    #[test]
+    fn canonical_keys_round_trip_and_never_collide() {
+        let canon: &[&[u8]] = &[b"0", b"1", b"z", b"u9fjjfgpj", b"e69sc1nee", b"k90zbopc5", b"zzzzzzzzzzz", b"10", b"a0"];
+        let mut seen = std::collections::HashMap::new();
+        for &s in canon {
+            let k = key(s);
+            assert!(canonical(k) && k != 0, "{:?}", s);
+            let mut out = Vec::new();
+            write_canonical(&mut out, k);
+            assert_eq!(out, s);
+            assert!(seen.insert(k, s).is_none());
+        }
+        let other: &[&[u8]] = &[b"", b"00", b"0a", b"U9fjjfgpj", b" u1", b"u1 ", b"u_1", b"zzzzzzzzzzzz", b"u1\r", b"\"u1\""];
+        for &s in other {
+            let k = key(s);
+            assert!(!canonical(k), "{:?}", s);
+            assert!(seen.insert(k, s).is_none(), "{:?} collides", s);
+        }
+        // random canonical strings round-trip and stay distinct
+        let mut x = 0x1234_5678u64;
+        let mut keys = std::collections::HashSet::new();
+        for _ in 0..200_000 {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            let len = 1 + (x % 11) as usize;
+            let mut s = Vec::new();
+            let mut y = x;
+            for i in 0..len {
+                let d = (y % 36) as u8;
+                y /= 36;
+                let d = if i == 0 && len > 1 && d == 0 { 1 } else { d };
+                s.push(if d < 10 { b'0' + d } else { b'a' + d - 10 });
+            }
+            let k = key(&s);
+            let mut out = Vec::new();
+            write_canonical(&mut out, k);
+            assert_eq!(out, s);
+            keys.insert((k, s));
+        }
+        let distinct_strings: std::collections::HashSet<_> = keys.iter().map(|x| x.1.clone()).collect();
+        let distinct_keys: std::collections::HashSet<_> = keys.iter().map(|x| x.0).collect();
+        assert_eq!(distinct_strings.len(), distinct_keys.len());
     }
 }

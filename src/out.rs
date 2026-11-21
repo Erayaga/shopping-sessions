@@ -45,13 +45,52 @@ fn day_str(d: i32) -> String {
     format!("{y:04}-{m:02}-{dd:02}")
 }
 
+/// A person's name: a canonical key (top bit clear) is written back as its
+/// ID; otherwise the low 63 bits are a ref into the input.
+fn name_bytes(ctx: &Ctx, name: u64, out: &mut Vec<u8>) {
+    if crate::canonical(name) {
+        crate::write_canonical(out, name);
+    } else {
+        out.extend_from_slice(ctx.corpus.bytes(name & !(1 << 63)));
+    }
+}
+
+/// The user_id column: canonical names written into one buffer and sliced,
+/// the others borrowed from the input.
+fn names_column(ctx: &Ctx, part: &[URow]) -> Vec<ByteArray> {
+    let mut buf: Vec<u8> = Vec::with_capacity(part.len() * 10);
+    let mut spans: Vec<(u32, u32)> = Vec::with_capacity(part.len());
+    for r in part {
+        if crate::canonical(r.name) {
+            let a = buf.len();
+            crate::write_canonical(&mut buf, r.name);
+            spans.push((a as u32, buf.len() as u32));
+        } else {
+            spans.push((u32::MAX, 0));
+        }
+    }
+    let all = Bytes::from(buf);
+    part.iter()
+        .zip(spans)
+        .map(|(r, (a, b))| {
+            if a == u32::MAX {
+                ByteArray::from(Bytes::from_static(ctx.corpus.bytes(r.name & !(1 << 63))))
+            } else {
+                ByteArray::from(all.slice(a as usize..b as usize))
+            }
+        })
+        .collect()
+}
+
 pub fn write_csv(out: &Path, ctx: &Ctx, users: &[Vec<URow>], camps: &[(u32, i32, [u64; 4])]) {
     fs::create_dir_all(out).unwrap();
     let mut w = BufWriter::new(File::create(out.join("user_daily.csv")).unwrap());
     w.write_all(b"user_id,day,sessions,events,revenue_cents,top_category\n").unwrap();
     for part in users {
         for r in part {
-            w.write_all(ctx.corpus.bytes(r.name)).unwrap();
+            let mut nb = Vec::new();
+            name_bytes(ctx, r.name, &mut nb);
+            w.write_all(&nb).unwrap();
             write!(w, ",{},{},{},{},", day_str(r.day), r.sessions, r.events, r.revenue).unwrap();
             if r.top != u16::MAX {
                 w.write_all(&ctx.cats[r.top as usize]).unwrap();
@@ -144,7 +183,7 @@ pub fn write_user_part(dir: &Path, n: usize, ctx: &Ctx, part: &[URow]) {
         }
     }
     let cols = vec![
-        Col::Bytes(part.iter().map(|r| ByteArray::from(Bytes::from_static(ctx.corpus.bytes(r.name)))).collect(), None),
+        Col::Bytes(names_column(ctx, part), None),
         Col::I32(part.iter().map(|r| r.day).collect()),
         Col::I64(part.iter().map(|r| r.sessions as i64).collect()),
         Col::I64(part.iter().map(|r| r.events as i64).collect()),
