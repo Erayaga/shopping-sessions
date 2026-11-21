@@ -219,20 +219,6 @@ where
     })
 }
 
-#[inline(always)]
-fn for_lines(data: &[u8], c: Chunk, mut f: impl FnMut(&[u8])) {
-    let mut p = c.start;
-    let end = c.end;
-    while p < end {
-        let nl = match memchr::memchr(b'\n', &data[p..end]) {
-            Some(i) => p + i,
-            None => end,
-        };
-        f(&data[p..nl]);
-        p = nl + 1;
-    }
-}
-
 /// NB output vectors per thread, each pre-sized.
 fn buckets<T>(cap: usize) -> Vec<Vec<T>> {
     (0..NB).map(|_| Vec::with_capacity(cap)).collect()
@@ -346,6 +332,48 @@ fn main() {
         let c = cats.binary_search(&r[1]).unwrap() as u32;
         prod_tab.insert(hash(&r[0]), c);
     }
+    // Fast path: when every product_id is canonical "p<n>" (n without leading
+    // zeros), a direct array indexed by n gives the same answers as the table;
+    // a non-canonical event product can't be in the file, so it's unknown.
+    let canon = |b: &[u8]| -> Option<usize> {
+        if b.len() < 2 || b.len() > 8 || b[0] != b'p' || !(b'1'..=b'9').contains(&b[1]) {
+            return None;
+        }
+        let mut n = 0usize;
+        for &c in &b[1..] {
+            if !c.is_ascii_digit() {
+                return None;
+            }
+            n = n * 10 + (c - b'0') as usize;
+        }
+        Some(n)
+    };
+    let direct: Option<Vec<u8>> = {
+        let mut max = 0;
+        let mut ok = !products.is_empty();
+        for r in &products {
+            match canon(&r[0]) {
+                Some(n) => max = max.max(n),
+                None => ok = false,
+            }
+        }
+        (ok && max <= 20_000_000).then(|| {
+            let mut v = vec![255u8; max + 1];
+            for r in &products {
+                v[canon(&r[0]).unwrap()] = cats.binary_search(&r[1]).unwrap() as u8;
+            }
+            v
+        })
+    };
+    let products_lookup = |b: &[u8]| -> u32 {
+        match &direct {
+            Some(v) => match canon(b) {
+                Some(n) if n < v.len() && v[n] != 255 => v[n] as u32,
+                _ => unknown_cat,
+            },
+            None => prod_tab.get(hash(b)).unwrap_or(unknown_cat),
+        }
+    };
     let campaigns = read_small(&data_dir.join("campaigns.csv"));
     let mut camp_tab: Table<u32> = Table::with_capacity(campaigns.len());
     for (i, r) in campaigns.iter().enumerate() {
@@ -373,9 +401,8 @@ fn main() {
         |(bk, nedges), i| {
             let c = link_chunks[i];
             let data: &[u8] = &corpus.maps[c.file as usize];
-            for_lines(data, c, |line| {
-                let mut f = [&b""[..]; 2];
-                if split(line, &mut f) && !f[0].is_empty() && !f[1].is_empty() {
+            parse::for_rows::<2>(data, c.start, c.end, |f| {
+                if !f[0].is_empty() && !f[1].is_empty() {
                     let e = *nedges;
                     *nedges += 1;
                     for side in 0..2 {
@@ -507,9 +534,8 @@ fn main() {
         |bk, i| {
             let c = event_chunks[i];
             let data: &[u8] = &corpus.maps[c.file as usize];
-            for_lines(data, c, |line| {
-                let mut f = [&b""[..]; 7];
-                if !split(line, &mut f) || f[0].is_empty() {
+            parse::for_rows::<7>(data, c.start, c.end, |f| {
+                if f[0].is_empty() {
                     return;
                 }
                 let eh = hash(f[0]);
@@ -536,7 +562,7 @@ fn main() {
                     if ingest_abs.saturating_sub(ts) > LATE {
                         break 'v;
                     }
-                    let cat = prod_tab.get(hash(f[5])).unwrap_or(unknown_cat);
+                    let cat = products_lookup(f[5]);
                     r.uh = hash(f[1]);
                     r.uref = corpus.rf(c.file, f[1]);
                     r.ts = (ts - t0) as u32;
@@ -557,9 +583,8 @@ fn main() {
         |bk, i| {
             let c = click_chunks[i];
             let data: &[u8] = &corpus.maps[c.file as usize];
-            for_lines(data, c, |line| {
-                let mut f = [&b""[..]; 4];
-                if !split(line, &mut f) || f[0].is_empty() || f[1].is_empty() || f[2].is_empty() {
+            parse::for_rows::<4>(data, c.start, c.end, |f| {
+                if f[0].is_empty() || f[1].is_empty() || f[2].is_empty() {
                     return;
                 }
                 let Some(camp) = camp_tab.get(hash(f[2])) else { return };

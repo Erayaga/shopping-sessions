@@ -44,6 +44,114 @@ pub fn split<'a, const N: usize>(line: &'a [u8], out: &mut [&'a [u8]; N]) -> boo
     n == N
 }
 
+/// Comma, newline and quote bitmasks of the 128 bytes at p.
+#[cfg(target_feature = "avx2")]
+#[inline(always)]
+unsafe fn masks128(p: *const u8) -> (u128, u128, u128) {
+    use std::arch::x86_64::*;
+    let comma = _mm256_set1_epi8(b',' as i8);
+    let nl = _mm256_set1_epi8(b'\n' as i8);
+    let quote = _mm256_set1_epi8(b'"' as i8);
+    let (mut c, mut n, mut q) = (0u128, 0u128, 0u128);
+    for k in 0..4 {
+        let v = _mm256_loadu_si256(p.add(32 * k) as *const __m256i);
+        c |= (_mm256_movemask_epi8(_mm256_cmpeq_epi8(v, comma)) as u32 as u128) << (32 * k);
+        n |= (_mm256_movemask_epi8(_mm256_cmpeq_epi8(v, nl)) as u32 as u128) << (32 * k);
+        q |= (_mm256_movemask_epi8(_mm256_cmpeq_epi8(v, quote)) as u32 as u128) << (32 * k);
+        if n != 0 {
+            break;
+        }
+    }
+    (c, n, q)
+}
+
+#[cfg(not(target_feature = "avx2"))]
+#[inline(always)]
+unsafe fn masks128(p: *const u8) -> (u128, u128, u128) {
+    let (mut c, mut n, mut q) = (0u128, 0u128, 0u128);
+    for i in 0..128 {
+        let b = *p.add(i);
+        c |= ((b == b',') as u128) << i;
+        n |= ((b == b'\n') as u128) << i;
+        q |= ((b == b'"') as u128) << i;
+        if b == b'\n' {
+            break;
+        }
+    }
+    (c, n, q)
+}
+
+/// Bits a..b (b exclusive, b <= 127).
+#[inline(always)]
+fn range(a: usize, b: usize) -> u128 {
+    ((1u128 << b) - 1) & !((1u128 << a) - 1)
+}
+
+/// Splits the line that starts at `start` (it ends at the next '\n' or at
+/// `end`). Returns where the next line starts and whether `out` holds a
+/// well-formed row. Same rules as `split`.
+#[inline(always)]
+pub fn next_line<'a, const N: usize>(data: &'a [u8], start: usize, end: usize, out: &mut [&'a [u8]; N]) -> (usize, bool) {
+    if start + 128 <= data.len() {
+        let (cm, nm, qm) = unsafe { masks128(data.as_ptr().add(start)) };
+        if nm != 0 {
+            let nl = nm.trailing_zeros() as usize;
+            if start + nl < end {
+                let next = start + nl + 1;
+                let valid = (1u128 << nl) - 1;
+                let mut commas = cm & valid;
+                if commas.count_ones() as usize != N - 1 {
+                    return (next, false);
+                }
+                let quotes = qm & valid;
+                let mut a = 0usize;
+                for (i, slot) in out.iter_mut().enumerate() {
+                    let b = if i + 1 < N {
+                        let t = commas.trailing_zeros() as usize;
+                        commas &= commas - 1;
+                        t
+                    } else {
+                        nl
+                    };
+                    let (mut fa, mut fb) = (a, b);
+                    if quotes != 0 {
+                        let fq = quotes & range(a, b);
+                        if fq != 0 {
+                            if b < a + 2 || fq != (1u128 << a) | (1u128 << (b - 1)) {
+                                return (next, false);
+                            }
+                            fa += 1;
+                            fb -= 1;
+                        }
+                    }
+                    *slot = &data[start + fa..start + fb];
+                    a = b + 1;
+                }
+                return (next, true);
+            }
+        }
+    }
+    let nl = match memchr::memchr(b'\n', &data[start..end]) {
+        Some(i) => start + i,
+        None => end,
+    };
+    (nl + 1, split(&data[start..nl], out))
+}
+
+/// Calls f for every well-formed row among the lines in data[start..end].
+#[inline(always)]
+pub fn for_rows<'a, const N: usize>(data: &'a [u8], start: usize, end: usize, mut f: impl FnMut(&[&'a [u8]; N])) {
+    let mut out: [&'a [u8]; N] = [&data[..0]; N];
+    let mut p = start;
+    while p < end {
+        let (next, ok) = next_line(data, p, end, &mut out);
+        if ok {
+            f(&out);
+        }
+        p = next;
+    }
+}
+
 #[inline(always)]
 fn digit(c: u8) -> Option<i64> {
     let d = c.wrapping_sub(b'0');
@@ -219,6 +327,67 @@ mod tests {
         assert_eq!(price(b"19.99"), None);
         assert_eq!(price(b"-5"), None);
         assert_eq!(price(b"000000000000000000000001"), Some(1));
+    }
+
+    /// The SIMD splitter must agree with the plain one on every line.
+    #[test]
+    fn simd_matches_scalar() {
+        let mut seed = 0x1234_5678_9abc_def0u64;
+        let mut rnd = |n: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed % n
+        };
+        let alphabet = b"ab\",,\r 1Z\"";
+        let mut buf = Vec::new();
+        let mut lines = Vec::new();
+        for _ in 0..20_000 {
+            let start = buf.len();
+            let len = rnd(140) as usize;
+            for _ in 0..len {
+                let r = rnd(100);
+                let c = if r < 60 { b'a' + (r % 26) as u8 } else { alphabet[(r % alphabet.len() as u64) as usize] };
+                buf.push(c);
+            }
+            // sometimes build a well-formed 4-field line with random quoting
+            if rnd(2) == 0 {
+                buf.truncate(start);
+                for k in 0..4 {
+                    if k > 0 {
+                        buf.push(b',');
+                    }
+                    let q = rnd(3) == 0;
+                    if q {
+                        buf.push(b'"');
+                    }
+                    for _ in 0..rnd(12) {
+                        buf.push(b'a' + rnd(26) as u8);
+                    }
+                    if q {
+                        buf.push(b'"');
+                    }
+                }
+            }
+            lines.push((start, buf.len()));
+            buf.push(b'\n');
+        }
+        buf.extend_from_slice(&[b'x'; 200]);
+        let end = buf.len() - 200;
+        let mut p = 0;
+        for &(s, e) in &lines {
+            assert_eq!(p, s);
+            let mut a = [&b""[..]; 4];
+            let mut b = [&b""[..]; 4];
+            let (next, ok) = next_line(&buf, p, end, &mut a);
+            let ok2 = split(&buf[s..e], &mut b);
+            assert_eq!(ok, ok2, "{:?}", String::from_utf8_lossy(&buf[s..e]));
+            if ok {
+                assert_eq!(a, b);
+            }
+            assert_eq!(next, e + 1);
+            p = next;
+        }
     }
 
     #[test]
