@@ -13,8 +13,11 @@
 //!   clicks  parse + validate -> by user_id bucket -> resolve -> by person bucket
 //!   people  per person bucket: sort, sessions, credit, assists, aggregates
 
+mod arena;
 mod out;
 mod parse;
+
+use arena::{gather, Parts};
 
 use std::fs::File;
 use std::path::{Path, PathBuf};
@@ -224,12 +227,35 @@ fn buckets<T>(cap: usize) -> Vec<Vec<T>> {
     (0..NB).map(|_| Vec::with_capacity(cap)).collect()
 }
 
-/// All of bucket b across the threads' outputs.
-fn gather<'a, T>(parts: &'a [Vec<Vec<T>>], b: usize) -> impl Iterator<Item = &'a T> {
-    parts.iter().flat_map(move |t| t[b].iter())
+/// Like `par`, and runs `fin(state)` on each thread before it exits.
+fn par_fin<S: Send, F, G>(threads: usize, n: usize, init: impl Fn() -> S + Sync, f: F, fin: G) -> Vec<S>
+where
+    F: Fn(&mut S, usize) + Sync,
+    G: Fn(&mut S) + Sync,
+{
+    let next = AtomicUsize::new(0);
+    std::thread::scope(|s| {
+        let hs: Vec<_> = (0..threads)
+            .map(|_| {
+                s.spawn(|| {
+                    let mut st = init();
+                    loop {
+                        let i = next.fetch_add(1, Ordering::Relaxed);
+                        if i >= n {
+                            break;
+                        }
+                        f(&mut st, i);
+                    }
+                    fin(&mut st);
+                    st
+                })
+            })
+            .collect();
+        hs.into_iter().map(|h| h.join().unwrap()).collect()
+    })
 }
 
-fn bucket_len<T>(parts: &[Vec<Vec<T>>], b: usize) -> usize {
+fn bucket_len_v<T>(parts: &[Vec<Vec<T>>], b: usize) -> usize {
     parts.iter().map(|t| t[b].len()).sum()
 }
 
@@ -386,8 +412,8 @@ fn main() {
     let mut bases = Vec::new();
     let mut next = 0u64;
     let (link_chunks, link_bytes) = add_files(&mut maps, &mut bases, &mut next, &list_csv(&data_dir.join("links")));
-    let (event_chunks, event_bytes) = add_files(&mut maps, &mut bases, &mut next, &list_csv(&data_dir.join("events")));
-    let (click_chunks, click_bytes) = add_files(&mut maps, &mut bases, &mut next, &list_csv(&data_dir.join("clicks")));
+    let (event_chunks, _event_bytes) = add_files(&mut maps, &mut bases, &mut next, &list_csv(&data_dir.join("events")));
+    let (click_chunks, _click_bytes) = add_files(&mut maps, &mut bases, &mut next, &list_csv(&data_dir.join("clicks")));
     // Leaked: lives for the whole run, so output can borrow its bytes zero-copy.
     let corpus: &'static Corpus = Box::leak(Box::new(Corpus { maps, bases }));
     lap("mapped");
@@ -429,7 +455,7 @@ fn main() {
                 NB,
                 Vec::<(usize, Interned)>::new,
                 |acc, b| {
-                    let n = bucket_len(&lp_parts, b);
+                    let n = bucket_len_v(&lp_parts, b);
                     let mut tab: Table<u32> = Table::with_capacity(n);
                     let mut ids = Vec::new();
                     let mut slots = Vec::with_capacity(n);
@@ -535,11 +561,10 @@ fn main() {
         // ================================================================ events: parse
         // Valid copies go to their user_id bucket in full; every copy also sends
         // (event_id hash, ingest) to its event_id bucket for duplicate detection.
-        let est = event_bytes / 70 / NB / threads + 16;
-        let ep = par(
+        let ep = par_fin(
             threads,
             event_chunks.len(),
-            || (buckets::<ERec>(est + est / 4), buckets::<(u64, i32)>(est + est / 4)),
+            || (Parts::<ERec>::new(NB), Parts::<(u64, i32)>::new(NB)),
             |(uk, dk), i| {
                 let c = event_chunks[i];
                 let data: &[u8] = &corpus.maps[c.file as usize];
@@ -550,7 +575,7 @@ fn main() {
                     let eh = hash(f[0]);
                     let ingest_abs = parse::timestamp(f[3]).unwrap_or(i64::MAX);
                     let ingest = ((ingest_abs.saturating_sub(t0)) / 1000).clamp(i32::MIN as i64, i32::MAX as i64) as i32;
-                    dk[bucket(eh)].push((eh, ingest));
+                    dk.push(bucket(eh), (eh, ingest));
                     if f[1].is_empty() || f[5].is_empty() {
                         return;
                     }
@@ -572,19 +597,19 @@ fn main() {
                     }
                     let cat = products_lookup(f[5]);
                     let uh = hash(f[1]);
-                    uk[bucket(uh)].push(ERec { eh, uh, uref: corpus.rf(c.file, f[1]), ts: (ts - t0) as u32, ingest, pc: price | (cat << 24) });
+                    uk.push(bucket(uh), ERec { eh, uh, uref: corpus.rf(c.file, f[1]), ts: (ts - t0) as u32, ingest, pc: price | (cat << 24) });
                 });
             },
+            |(uk, dk)| { uk.finish(); dk.finish(); },
         );
         let (ep_valid, ep_ids): (Vec<_>, Vec<_>) = ep.into_iter().unzip();
         lap("events parsed");
 
         // ================================================================ clicks: parse
-        let est = click_bytes / 40 / NB / threads + 16;
-        let cp = par(
+        let cp = par_fin(
             threads,
             click_chunks.len(),
-            || buckets::<Ck>(est + est / 4),
+            || Parts::<Ck>::new(NB),
             |bk, i| {
                 let c = click_chunks[i];
                 let data: &[u8] = &corpus.maps[c.file as usize];
@@ -598,9 +623,10 @@ fn main() {
                         return;
                     }
                     let uh = hash(f[1]);
-                    bk[bucket(uh)].push(Ck { key: uh, cid: corpus.rf(c.file, f[0]), ts: (ts - t0) as u32, camp });
+                    bk.push(bucket(uh), Ck { key: uh, cid: corpus.rf(c.file, f[0]), ts: (ts - t0) as u32, camp });
                 });
             },
+            |bk| bk.finish(),
         );
         lap("clicks parsed");
         (links.join().unwrap(), ep_valid, ep_ids, cp)
@@ -686,10 +712,10 @@ fn main() {
     // ================================================================ resolve people per user_id bucket
     // Drops the losing copies of duplicated events (identical winning copies
     // share a user_id, so they meet here and only one is kept).
-    let rp = par(
+    let rp = par_fin(
         threads,
         NB,
-        || (buckets::<Ev>(0), buckets::<Ck>(0), std::collections::HashSet::<u64>::new()),
+        || (Parts::<Ev>::new(NB), Parts::<Ck>::new(NB), std::collections::HashSet::<u64>::new()),
         |(eo, co, seen), b| {
             let tab = &people[b];
             seen.clear();
@@ -706,13 +732,14 @@ fn main() {
                     }
                 }
                 let (key, r) = tab.get(e.uh).unwrap_or((e.uh, e.uref));
-                eo[bucket(key)].push(Ev { key, r, ts: e.ts, pc: e.pc });
+                eo.push(bucket(key), Ev { key, r, ts: e.ts, pc: e.pc });
             }
             for c in gather(&cp, b) {
                 let key = tab.get(c.key).map_or(c.key, |x| x.0);
-                co[bucket(key)].push(Ck { key, ..*c });
+                co.push(bucket(key), Ck { key, ..*c });
             }
         },
+        |(eo, co, _)| { eo.finish(); co.finish(); },
     );
     drop(ep_valid);
     drop(cp);
