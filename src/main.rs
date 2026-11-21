@@ -773,7 +773,15 @@ fn main() {
     let ncamp = campaigns.len() + 1;
     let ncats = cats.len();
     let ctx = PCtx { t0, day0, ndays, organic, ws_rel, we_rel };
-    let results = par(
+    let cats: &'static [Vec<u8>] = Box::leak(cats.into_boxed_slice());
+    let octx = out::Ctx { corpus, cats, campaigns: &campaigns, organic };
+    let ud_dir = out_dir.join("user_daily");
+    if !csv_out {
+        std::fs::create_dir_all(&ud_dir).unwrap();
+        std::fs::create_dir_all(out_dir.join("campaign_daily")).unwrap();
+    }
+    let part_no = AtomicUsize::new(0);
+    let results = par_fin(
         threads,
         NB,
         || Worker {
@@ -794,6 +802,13 @@ fn main() {
         },
         |w, b| {
             w.bucket(&ev_parts, &ck_parts, b, &ctx, corpus);
+        },
+        |w| {
+            // Overlaps with the threads still working on buckets.
+            if !csv_out && !w.rows.is_empty() {
+                let n = part_no.fetch_add(1, Ordering::Relaxed);
+                out::write_user_part(&ud_dir, n, &octx, &w.rows);
+            }
         },
     );
     drop(ev_parts);
@@ -821,12 +836,14 @@ fn main() {
     let user_parts: Vec<Vec<URow>> = results.into_iter().map(|w| w.rows).collect();
     let nrows: usize = user_parts.iter().map(|v| v.len()).sum();
 
-    let cats: &'static [Vec<u8>] = Box::leak(cats.into_boxed_slice());
-    let octx = out::Ctx { corpus, cats, campaigns: &campaigns, organic };
     if csv_out {
         out::write_csv(&out_dir, &octx, &user_parts, &crows);
     } else {
-        out::write_parquet(&out_dir, &octx, &user_parts, &crows, threads);
+        if part_no.load(Ordering::Relaxed) == 0 {
+            // no rows at all: still write one (empty) user_daily file
+            out::write_user_part(&ud_dir, 0, &octx, &[]);
+        }
+        out::write_campaigns(&out_dir.join("campaign_daily"), &octx, &crows);
     }
     lap(&format!("wrote {nrows} user rows, {} campaign rows", crows.len()));
 }
@@ -882,12 +899,15 @@ impl Worker {
         if ne == 0 {
             return;
         }
-        // Sized for ~4 events per person (they average far more); grows if needed.
-        let mut cap = (ne / 2).next_power_of_two().max(64);
-        let mut mask = cap - 1;
+        // Sized for ~4 events per person (they average far more); grows if
+        // needed. Kept between buckets and reset by its used slots only.
+        let want = (ne / 2).next_power_of_two().max(64);
         let mut ltab = std::mem::take(&mut self.ltab);
-        ltab.clear();
-        ltab.resize(cap, (0, 0));
+        if ltab.len() < want {
+            ltab = vec![(0, 0); want];
+        }
+        let mut cap = ltab.len();
+        let mut mask = cap - 1;
         let mut cnt = std::mem::take(&mut self.cnt);
         cnt.clear();
         let mut idx = std::mem::take(&mut self.idx);
@@ -1002,6 +1022,15 @@ impl Worker {
             }
             let (ev, ck) = (&es[cnt[p] as usize..cnt[p + 1] as usize], &cs[ccnt[p] as usize..ccnt[p + 1] as usize]);
             self.person(ev, ck, ctx);
+        }
+        // reset the used slots: each person's key is still in its slot
+        for p in 0..np {
+            let k = es[cnt[p] as usize].key;
+            let mut i = (k as usize) & mask;
+            while ltab[i].0 != k {
+                i = (i + 1) & mask;
+            }
+            ltab[i].0 = 0;
         }
         self.ltab = ltab;
         self.cnt = cnt;

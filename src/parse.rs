@@ -231,7 +231,7 @@ fn days_in_month(y: i64, m: i64) -> i64 {
 
 /// `YYYY-MM-DDTHH:MM:SS` in b[..19], as epoch ms.
 #[inline(always)]
-fn datetime(b: &[u8]) -> Option<i64> {
+fn datetime_ref(b: &[u8]) -> Option<i64> {
     if b[4] != b'-' || b[7] != b'-' || b[10] != b'T' || b[13] != b':' || b[16] != b':' {
         return None;
     }
@@ -260,16 +260,16 @@ fn datetime(b: &[u8]) -> Option<i64> {
 /// Any of the three forms, as epoch ms. None for a malformed value; an F3
 /// value too big for i64 is also None, which is just as outside every window.
 #[inline]
-pub fn timestamp(b: &[u8]) -> Option<i64> {
+pub fn timestamp_ref(b: &[u8]) -> Option<i64> {
     let len = b.len();
     if len == 0 {
         return None;
     }
     if len == 20 && b[19] == b'Z' {
-        return datetime(b);
+        return datetime_ref(b);
     }
     if len == 25 && (b[19] == b'+' || b[19] == b'-') && b[22] == b':' {
-        let base = datetime(b)?;
+        let base = datetime_ref(b)?;
         let oh = two(b, 20)?;
         let om = two(b, 23)?;
         if oh > 23 || om > 59 {
@@ -452,5 +452,201 @@ mod tests {
         assert!(!split(b"", &mut f));
         assert!(!split(b"u1", &mut f));
         assert!(!split(b"\",u1", &mut f));
+    }
+}
+
+
+// ---------------------------------------------------------------- SWAR
+// Eight ASCII digits in one little-endian u64: validated together and
+// converted with three multiplies (Lemire, "SWAR explained: parsing eight
+// digits").
+
+#[inline(always)]
+fn load8(b: &[u8], at: usize) -> u64 {
+    u64::from_le_bytes(b[at..at + 8].try_into().unwrap())
+}
+
+/// True if all eight bytes are ASCII digits.
+#[inline(always)]
+fn all_digits(v: u64) -> bool {
+    ((v & 0xF0F0_F0F0_F0F0_F0F0) | (((v.wrapping_add(0x0606_0606_0606_0606)) & 0xF0F0_F0F0_F0F0_F0F0) >> 4))
+        == 0x3333_3333_3333_3333
+}
+
+/// The value of eight digits (byte 0 most significant). `v` must be all digits.
+#[inline(always)]
+fn value8(v: u64) -> u64 {
+    let v = v & 0x0F0F_0F0F_0F0F_0F0F;
+    let v = (v.wrapping_mul(2561)) >> 8;
+    let v = ((v & 0x00FF_00FF_00FF_00FF).wrapping_mul(6_553_601)) >> 16;
+    ((v & 0x0000_FFFF_0000_FFFF).wrapping_mul(42_949_672_960_001)) >> 32
+}
+
+/// The first k (1..=8) digits of b as one value, or None if not all digits.
+#[inline(always)]
+fn lead(b: &[u8], k: usize) -> Option<u64> {
+    // shift the k bytes to the top and fill the low bytes with '0'
+    let v = if b.len() >= 8 {
+        load8(b, 0)
+    } else {
+        let mut a = [b'0'; 8];
+        a[..b.len()].copy_from_slice(b);
+        u64::from_le_bytes(a)
+    };
+    let sh = 8 * (8 - k) as u32;
+    let v = if k == 8 { v } else { (v << sh) | (0x3030_3030_3030_3030u64 >> (64 - sh)) };
+    all_digits(v).then(|| value8(v))
+}
+
+/// F3: digits only, leading zeros allowed.
+#[inline(always)]
+fn epoch_ms(b: &[u8]) -> Option<i64> {
+    let n = b.len();
+    if n <= 8 {
+        return lead(b, n).map(|v| v as i64);
+    }
+    if n <= 16 {
+        let lo = load8(b, n - 8);
+        if !all_digits(lo) {
+            return None;
+        }
+        let hi = lead(b, n - 8)?;
+        return Some((hi * 100_000_000 + value8(lo)) as i64);
+    }
+    timestamp_ref(b)
+}
+
+/// `YYYY-MM-DDTHH:MM:SS` in b[..19] (b.len() >= 20), as epoch ms.
+#[inline(always)]
+fn datetime(b: &[u8]) -> Option<i64> {
+    let a = load8(b, 0); // YYYY-MM-
+    let c = load8(b, 8); // DDTHH:MM
+    const SA: u64 = (0xFF << 32) | (0xFF << 56);
+    const SC: u64 = (0xFF << 16) | (0xFF << 40);
+    if a & SA != ((b'-' as u64) << 32 | (b'-' as u64) << 56)
+        || c & SC != ((b'T' as u64) << 16 | (b':' as u64) << 40)
+        || b[16] != b':'
+    {
+        return None;
+    }
+    let a0 = (a & !SA) | (0x30 << 32) | (0x30 << 56);
+    let c0 = (c & !SC) | (0x30 << 16) | (0x30 << 40);
+    let (s1, s2) = (b[17].wrapping_sub(b'0'), b[18].wrapping_sub(b'0'));
+    if !all_digits(a0) || !all_digits(c0) || s1 > 9 || s2 > 9 {
+        return None;
+    }
+    let va = a0 & 0x0F0F_0F0F_0F0F_0F0F;
+    let vc = c0 & 0x0F0F_0F0F_0F0F_0F0F;
+    let byte = |v: u64, i: u32| ((v >> (8 * i)) & 0xFF) as i64;
+    let y = byte(va, 0) * 1000 + byte(va, 1) * 100 + byte(va, 2) * 10 + byte(va, 3);
+    let mo = byte(va, 5) * 10 + byte(va, 6);
+    let d = byte(vc, 0) * 10 + byte(vc, 1);
+    let h = byte(vc, 3) * 10 + byte(vc, 4);
+    let mi = byte(vc, 6) * 10 + byte(vc, 7);
+    let sec = (s1 * 10 + s2) as i64;
+    if !(1..=12).contains(&mo) || h > 23 || mi > 59 || sec > 59 || d < 1 {
+        return None;
+    }
+    if (TABLE_Y0..TABLE_Y0 + TABLE_YEARS).contains(&y) {
+        let (start, dim) = MONTHS[((y - TABLE_Y0) * 12 + mo - 1) as usize];
+        if d > dim as i64 {
+            return None;
+        }
+        return Some((((start as i64 + d - 1) * 24 + h) * 60 + mi) * 60_000 + sec * SECOND);
+    }
+    if d > days_in_month(y, mo) {
+        return None;
+    }
+    Some(((days_from_civil(y, mo, d) * 24 + h) * 60 + mi) * 60_000 + sec * SECOND)
+}
+
+/// Any of the three forms, as epoch ms. None for a malformed value; an F3
+/// value too big for i64 is also None, which is just as outside every window.
+#[inline]
+pub fn timestamp(b: &[u8]) -> Option<i64> {
+    let len = b.len();
+    if len == 0 {
+        return None;
+    }
+    if len == 20 && b[19] == b'Z' {
+        return datetime(b);
+    }
+    if len == 25 && (b[19] == b'+' || b[19] == b'-') && b[22] == b':' {
+        let base = datetime(b)?;
+        let oh = two(b, 20)?;
+        let om = two(b, 23)?;
+        if oh > 23 || om > 59 {
+            return None;
+        }
+        let off = (oh * 60 + om) * 60_000;
+        return Some(if b[19] == b'+' { base - off } else { base + off });
+    }
+    if b[0].is_ascii_digit() {
+        return epoch_ms(b);
+    }
+    None
+}
+
+#[cfg(test)]
+mod swar_tests {
+    use super::*;
+
+    /// The SWAR parser agrees with the scalar reference on valid timestamps
+    /// of all three forms and on many corrupted variants of them.
+    #[test]
+    fn swar_matches_reference() {
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut rnd = |n: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed % n
+        };
+        let alphabet = b"0123456789-T:Z+tz .e\r\xd9\x30";
+        let mut checked = 0;
+        for _ in 0..300_000 {
+            let ms = rnd(6_000_000_000_000) as i64 - 1_000_000_000_000;
+            let days = ms.div_euclid(DAY);
+            let (y, m, d) = civil_from_days(days);
+            let sod = ms.rem_euclid(DAY) / 1000;
+            let (h, mi, sc) = (sod / 3600, sod / 60 % 60, sod % 60);
+            let mut t: Vec<u8> = match rnd(4) {
+                0 => format!("{y:04}-{m:02}-{d:02}T{h:02}:{mi:02}:{sc:02}Z").into_bytes(),
+                1 => {
+                    let sign = if rnd(2) == 0 { '+' } else { '-' };
+                    let (oh, om) = (rnd(26), rnd(62));
+                    format!("{y:04}-{m:02}-{d:02}T{h:02}:{mi:02}:{sc:02}{sign}{oh:02}:{om:02}").into_bytes()
+                }
+                2 => format!("{}{}", "0".repeat(rnd(4) as usize), ms.max(0)).into_bytes(),
+                _ => {
+                    let e = rnd(18) as u32 + 1;
+                    format!("{}", rnd(10u64.pow(e))).into_bytes()
+                }
+            };
+            // corrupt some of them
+            match rnd(5) {
+                0 if !t.is_empty() => {
+                    let i = rnd(t.len() as u64) as usize;
+                    t[i] = alphabet[rnd(alphabet.len() as u64) as usize];
+                }
+                1 if !t.is_empty() => {
+                    t.truncate(rnd(t.len() as u64) as usize);
+                }
+                2 => t.push(alphabet[rnd(alphabet.len() as u64) as usize]),
+                _ => {}
+            }
+            assert_eq!(timestamp(&t), timestamp_ref(&t), "{:?}", String::from_utf8_lossy(&t));
+            checked += 1;
+        }
+        // month/day edge cases around leap years
+        for y in [1900i64, 2000, 2024, 2027, 2028, 2100] {
+            for m in 1..=13 {
+                for d in 0..=32 {
+                    let t = format!("{y:04}-{m:02}-{d:02}T23:59:59Z");
+                    assert_eq!(timestamp(t.as_bytes()), timestamp_ref(t.as_bytes()), "{t}");
+                }
+            }
+        }
+        assert!(checked > 0);
     }
 }

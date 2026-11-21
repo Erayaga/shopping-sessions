@@ -131,50 +131,38 @@ fn write_file(path: &Path, schema: &str, cols: Vec<Col>) {
     writer.close().unwrap();
 }
 
-pub fn write_parquet(out: &Path, ctx: &Ctx, users: &[Vec<URow>], camps: &[(u32, i32, [u64; 4])], _threads: usize) {
-    let ud = out.join("user_daily");
-    let cd = out.join("campaign_daily");
-    fs::create_dir_all(&ud).unwrap();
-    fs::create_dir_all(&cd).unwrap();
-    std::thread::scope(|s| {
-        for (t, part) in users.iter().enumerate() {
-            if part.is_empty() && t > 0 {
-                continue;
-            }
-            let ud = &ud;
-            s.spawn(move || {
-                let mut top = Vec::new();
-                let mut def = Vec::with_capacity(part.len());
-                for r in part {
-                    if r.top == u16::MAX {
-                        def.push(0i16);
-                    } else {
-                        def.push(1);
-                        top.push(ByteArray::from(Bytes::from_static(&ctx.cats[r.top as usize])));
-                    }
-                }
-                let cols = vec![
-                    Col::Bytes(part.iter().map(|r| ByteArray::from(Bytes::from_static(ctx.corpus.bytes(r.name)))).collect(), None),
-                    Col::I32(part.iter().map(|r| r.day).collect()),
-                    Col::I64(part.iter().map(|r| r.sessions as i64).collect()),
-                    Col::I64(part.iter().map(|r| r.events as i64).collect()),
-                    Col::I64(part.iter().map(|r| r.revenue as i64).collect()),
-                    Col::Bytes(top, Some(def)),
-                ];
-                write_file(&ud.join(format!("part-{t:03}.parquet")), USER_SCHEMA, cols);
-            });
+/// Writes one thread's user_daily rows as dir/part-NNN.parquet.
+pub fn write_user_part(dir: &Path, n: usize, ctx: &Ctx, part: &[URow]) {
+    let mut top = Vec::new();
+    let mut def = Vec::with_capacity(part.len());
+    for r in part {
+        if r.top == u16::MAX {
+            def.push(0i16);
+        } else {
+            def.push(1);
+            top.push(ByteArray::from(Bytes::from_static(&ctx.cats[r.top as usize])));
         }
-        s.spawn(|| {
-            let cols = vec![
-                Col::Bytes(camps.iter().map(|c| ByteArray::from(ctx.camp_id(c.0).to_vec())).collect(), None),
-                Col::Bytes(camps.iter().map(|c| ByteArray::from(ctx.channel(c.0).to_vec())).collect(), None),
-                Col::I32(camps.iter().map(|c| c.1).collect()),
-                Col::I64(camps.iter().map(|c| c.2[0] as i64).collect()),
-                Col::I64(camps.iter().map(|c| c.2[1] as i64).collect()),
-                Col::I64(camps.iter().map(|c| c.2[2] as i64).collect()),
-                Col::I64(camps.iter().map(|c| c.2[3] as i64).collect()),
-            ];
-            write_file(&cd.join("part-000.parquet"), CAMP_SCHEMA, cols);
-        });
-    });
+    }
+    let cols = vec![
+        Col::Bytes(part.iter().map(|r| ByteArray::from(Bytes::from_static(ctx.corpus.bytes(r.name)))).collect(), None),
+        Col::I32(part.iter().map(|r| r.day).collect()),
+        Col::I64(part.iter().map(|r| r.sessions as i64).collect()),
+        Col::I64(part.iter().map(|r| r.events as i64).collect()),
+        Col::I64(part.iter().map(|r| r.revenue as i64).collect()),
+        Col::Bytes(top, Some(def)),
+    ];
+    write_file(&dir.join(format!("part-{n:03}.parquet")), USER_SCHEMA, cols);
+}
+
+pub fn write_campaigns(dir: &Path, ctx: &Ctx, camps: &[(u32, i32, [u64; 4])]) {
+    let cols = vec![
+        Col::Bytes(camps.iter().map(|c| ByteArray::from(ctx.camp_id(c.0).to_vec())).collect(), None),
+        Col::Bytes(camps.iter().map(|c| ByteArray::from(ctx.channel(c.0).to_vec())).collect(), None),
+        Col::I32(camps.iter().map(|c| c.1).collect()),
+        Col::I64(camps.iter().map(|c| c.2[0] as i64).collect()),
+        Col::I64(camps.iter().map(|c| c.2[1] as i64).collect()),
+        Col::I64(camps.iter().map(|c| c.2[2] as i64).collect()),
+        Col::I64(camps.iter().map(|c| c.2[3] as i64).collect()),
+    ];
+    write_file(&dir.join("part-000.parquet"), CAMP_SCHEMA, cols);
 }
