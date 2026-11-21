@@ -22,6 +22,18 @@ pub struct Arena {
     end: usize,
 }
 
+/// Regions of dropped arenas, already faulted in (and zeroed once by the
+/// kernel), reused by later stages instead of fresh memory.
+static POOL: std::sync::Mutex<Vec<MmapMut>> = std::sync::Mutex::new(Vec::new());
+
+impl Drop for Arena {
+    fn drop(&mut self) {
+        if let Ok(mut p) = POOL.lock() {
+            p.append(&mut self.maps);
+        }
+    }
+}
+
 // The arena only hands out raw blocks; ownership moves with it between threads.
 unsafe impl Send for Arena {}
 unsafe impl Sync for Arena {}
@@ -36,11 +48,18 @@ impl Arena {
     #[inline]
     fn block(&mut self) -> *mut u8 {
         if self.cur + BLOCK > self.end {
-            let mut m = MmapMut::map_anon(REGION + HUGE).expect("map anonymous region");
-            #[cfg(target_os = "linux")]
-            {
-                let _ = m.advise(memmap2::Advice::HugePage);
-            }
+            let reused = POOL.lock().ok().and_then(|mut p| p.pop());
+            let mut m = match reused {
+                Some(m) => m,
+                None => {
+                    let m = MmapMut::map_anon(REGION + HUGE).expect("map anonymous region");
+                    #[cfg(target_os = "linux")]
+                    {
+                        let _ = m.advise(memmap2::Advice::HugePage);
+                    }
+                    m
+                }
+            };
             let base = m.as_mut_ptr() as usize;
             self.cur = (base + HUGE - 1) & !(HUGE - 1);
             self.end = self.cur + REGION;
@@ -232,3 +251,4 @@ mod tests {
         check(|i| (i, i ^ 5, i * 3, i as u32, i as u32 + 1, i as u32 + 2)); // 40 bytes
     }
 }
+
