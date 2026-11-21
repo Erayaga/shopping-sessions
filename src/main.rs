@@ -14,6 +14,7 @@
 //!   people  per person bucket: sort, sessions, credit, assists, aggregates
 
 mod arena;
+mod dense;
 mod out;
 mod parse;
 
@@ -504,6 +505,10 @@ fn main() {
         .max(1);
     let lap = |what: &str| eprintln!("[{:>8.3}s] {what}", t0_clock.elapsed().as_secs_f64());
 
+    if std::env::var_os("DENSE_PROBE").is_some() {
+        dense::probe(&data_dir);
+        return;
+    }
     let manifest = std::fs::read_to_string(data_dir.join("manifest.json")).expect("manifest");
     let ws = manifest_time(&manifest, "window_start");
     let we = manifest_time(&manifest, "window_end");
