@@ -5,6 +5,8 @@ use std::io::{BufWriter, Write};
 use std::path::Path;
 use std::sync::Arc;
 
+use bytes::Bytes;
+
 use parquet::basic::Compression;
 use parquet::data_type::{ByteArray, ByteArrayType, Int32Type, Int64Type};
 use parquet::file::properties::{EnabledStatistics, WriterProperties};
@@ -15,8 +17,8 @@ use crate::parse::civil_from_days;
 use crate::{Corpus, URow};
 
 pub struct Ctx<'a> {
-    pub corpus: &'a Corpus,
-    pub cats: &'a [Vec<u8>],
+    pub corpus: &'static Corpus,
+    pub cats: &'static [Vec<u8>],
     pub campaigns: &'a [Vec<Vec<u8>>],
     pub organic: u32,
 }
@@ -148,11 +150,11 @@ pub fn write_parquet(out: &Path, ctx: &Ctx, users: &[Vec<URow>], camps: &[(u32, 
                         def.push(0i16);
                     } else {
                         def.push(1);
-                        top.push(ByteArray::from(ctx.cats[r.top as usize].clone()));
+                        top.push(ByteArray::from(Bytes::from_static(&ctx.cats[r.top as usize])));
                     }
                 }
                 let cols = vec![
-                    Col::Bytes(part.iter().map(|r| ByteArray::from(ctx.corpus.bytes(r.name).to_vec())).collect(), None),
+                    Col::Bytes(part.iter().map(|r| ByteArray::from(Bytes::from_static(ctx.corpus.bytes(r.name)))).collect(), None),
                     Col::I32(part.iter().map(|r| r.day).collect()),
                     Col::I64(part.iter().map(|r| r.sessions as i64).collect()),
                     Col::I64(part.iter().map(|r| r.events as i64).collect()),

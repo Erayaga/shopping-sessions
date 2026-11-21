@@ -388,229 +388,245 @@ fn main() {
     let (link_chunks, link_bytes) = add_files(&mut maps, &mut bases, &mut next, &list_csv(&data_dir.join("links")));
     let (event_chunks, event_bytes) = add_files(&mut maps, &mut bases, &mut next, &list_csv(&data_dir.join("events")));
     let (click_chunks, click_bytes) = add_files(&mut maps, &mut bases, &mut next, &list_csv(&data_dir.join("clicks")));
-    let corpus = Corpus { maps, bases };
+    // Leaked: lives for the whole run, so output can borrow its bytes zero-copy.
+    let corpus: &'static Corpus = Box::leak(Box::new(Corpus { maps, bases }));
     lap("mapped");
 
-    // ================================================================ links
-    // Parse: each side goes to its ID bucket as (hash, ref, thread-local slot).
-    let est = link_bytes / 18 / NB / threads + 16;
-    let lp = par(
-        threads,
-        link_chunks.len(),
-        || (buckets::<(u64, u64, u64, u32)>(est * 2), 0u32),
-        |(bk, nedges), i| {
-            let c = link_chunks[i];
-            let data: &[u8] = &corpus.maps[c.file as usize];
-            parse::for_rows::<2>(data, c.start, c.end, |f| {
-                if !f[0].is_empty() && !f[1].is_empty() {
-                    let e = *nedges;
-                    *nedges += 1;
-                    for side in 0..2 {
-                        let h = hash(f[side]);
-                        bk[bucket(h)].push((h, corpus.rf(c.file, f[side]), prefix(f[side]), e * 2 + side as u32));
-                    }
-                }
-            });
-        },
-    );
-    // Intern per bucket: local index per distinct ID.
-    let (lp_parts, lp_edges): (Vec<Vec<Vec<(u64, u64, u64, u32)>>>, Vec<u32>) = lp.into_iter().unzip();
-    struct Interned {
-        ids: Vec<(u64, u64, u64)>,   // (hash, ref, prefix) per local index
-        slots: Vec<(u32, u32, u32)>, // (thread, slot, local index)
-    }
-    let interned: Vec<Interned> = {
-        let per = par(
+    // Links don't feed parsing (people are resolved after it), so they run
+    // on their own thread while events and clicks are parsed.
+    let links_job = || {
+        // ================================================================ links
+        // Parse: each side goes to its ID bucket as (hash, ref, thread-local slot).
+        let est = link_bytes / 18 / NB / threads + 16;
+        let lp = par(
             threads,
-            NB,
-            Vec::<(usize, Interned)>::new,
-            |acc, b| {
-                let n = bucket_len(&lp_parts, b);
-                let mut tab: Table<u32> = Table::with_capacity(n);
-                let mut ids = Vec::new();
-                let mut slots = Vec::with_capacity(n);
-                for (t, part) in lp_parts.iter().enumerate() {
-                    for &(h, r, pf, s) in &part[b] {
-                        let (v, new) = tab.slot(h);
-                        if new {
-                            *v = ids.len() as u32;
-                            ids.push((h, r, pf));
+            link_chunks.len(),
+            || (buckets::<(u64, u64, u64, u32)>(est * 2), 0u32),
+            |(bk, nedges), i| {
+                let c = link_chunks[i];
+                let data: &[u8] = &corpus.maps[c.file as usize];
+                parse::for_rows::<2>(data, c.start, c.end, |f| {
+                    if !f[0].is_empty() && !f[1].is_empty() {
+                        let e = *nedges;
+                        *nedges += 1;
+                        for side in 0..2 {
+                            let h = hash(f[side]);
+                            bk[bucket(h)].push((h, corpus.rf(c.file, f[side]), prefix(f[side]), e * 2 + side as u32));
                         }
-                        slots.push((t as u32, s, *v));
                     }
-                }
-                acc.push((b, Interned { ids, slots }));
+                });
             },
         );
-        let mut all: Vec<(usize, Interned)> = per.into_iter().flatten().collect();
-        all.sort_unstable_by_key(|x| x.0);
-        all.into_iter().map(|x| x.1).collect()
-    };
-    drop(lp_parts);
-    lap("links: parsed+interned");
-    let mut offs = vec![0u32; NB + 1];
-    for b in 0..NB {
-        offs[b + 1] = offs[b] + interned[b].ids.len() as u32;
-    }
-    let n_ids = offs[NB] as usize;
-    let mut edges: Vec<Vec<u32>> = lp_edges.iter().map(|&n| vec![0u32; n as usize * 2]).collect();
-    for (b, it) in interned.iter().enumerate() {
-        for &(t, s, l) in &it.slots {
-            edges[t as usize][s as usize] = offs[b] + l;
+        // Intern per bucket: local index per distinct ID.
+        let (lp_parts, lp_edges): (Vec<Vec<Vec<(u64, u64, u64, u32)>>>, Vec<u32>) = lp.into_iter().unzip();
+        struct Interned {
+            ids: Vec<(u64, u64, u64)>,   // (hash, ref, prefix) per local index
+            slots: Vec<(u32, u32, u32)>, // (thread, slot, local index)
         }
-    }
-    lap("links: edges");
-    let mut parent: Vec<u32> = (0..n_ids as u32).collect();
-    fn find(parent: &mut [u32], mut x: u32) -> u32 {
-        let mut r = x;
-        while parent[r as usize] != r {
-            r = parent[r as usize];
-        }
-        while parent[x as usize] != r {
-            let n = parent[x as usize];
-            parent[x as usize] = r;
-            x = n;
-        }
-        r
-    }
-    for e in &edges {
-        for pair in e.chunks_exact(2) {
-            let (x, y) = (find(&mut parent, pair[0]), find(&mut parent, pair[1]));
-            if x != y {
-                // union by smaller index keeps trees shallow enough with compression
-                if x < y {
-                    parent[y as usize] = x;
-                } else {
-                    parent[x as usize] = y;
-                }
-            }
-        }
-    }
-    drop(edges);
-    lap("links: union-find");
-    // Flat per-ID arrays in global index order.
-    let mut gid: Vec<(u64, u64, u64)> = Vec::with_capacity(n_ids);
-    for it in &interned {
-        gid.extend_from_slice(&it.ids);
-    }
-    // best[root] = member with the byte-wise smallest ID
-    let mut best: Vec<u32> = (0..n_ids as u32).collect();
-    for g in 0..n_ids as u32 {
-        let r = find(&mut parent, g);
-        if r != g {
-            let cur = best[r as usize];
-            let (a, c) = (&gid[g as usize], &gid[cur as usize]);
-            if a.2 < c.2 || (a.2 == c.2 && corpus.bytes(a.1) < corpus.bytes(c.1)) {
-                best[r as usize] = g;
-            }
-        }
-    }
-    lap("links: names");
-    // Per ID bucket: ID hash -> (name hash, name ref).
-    let people: Vec<Table<(u64, u64)>> = {
-        let per = par(threads, NB, Vec::<(usize, Table<(u64, u64)>)>::new, |acc, b| {
-            let it = &interned[b];
-            let mut tab = Table::with_capacity(it.ids.len());
-            for (l, &(h, _, _)) in it.ids.iter().enumerate() {
-                let g = offs[b] + l as u32;
-                let n = &gid[best[parent[g as usize] as usize] as usize];
-                tab.insert(h, (n.0, n.1));
-            }
-            acc.push((b, tab));
-        });
-        let mut all: Vec<_> = per.into_iter().flatten().collect();
-        all.sort_unstable_by_key(|x| x.0);
-        all.into_iter().map(|x| x.1).collect()
-    };
-    drop((interned, best, parent, gid));
-    lap(&format!("links: {n_ids} ids"));
-
-    // ================================================================ events: parse
-    let est = event_bytes / 70 / NB / threads + 16;
-    let ep = par(
-        threads,
-        event_chunks.len(),
-        || buckets::<ERec>(est + est / 4),
-        |bk, i| {
-            let c = event_chunks[i];
-            let data: &[u8] = &corpus.maps[c.file as usize];
-            parse::for_rows::<7>(data, c.start, c.end, |f| {
-                if f[0].is_empty() {
-                    return;
-                }
-                let eh = hash(f[0]);
-                let ingest_abs = parse::timestamp(f[3]).unwrap_or(i64::MAX);
-                let ingest = ((ingest_abs.saturating_sub(t0)) / 1000).clamp(i32::MIN as i64, i32::MAX as i64) as i32;
-                let mut r = ERec { eh, uh: 0, uref: 0, ts: INVALID, ingest, pc: 0 };
-                'v: {
-                    if f[1].is_empty() || f[5].is_empty() {
-                        break 'v;
+        let interned: Vec<Interned> = {
+            let per = par(
+                threads,
+                NB,
+                Vec::<(usize, Interned)>::new,
+                |acc, b| {
+                    let n = bucket_len(&lp_parts, b);
+                    let mut tab: Table<u32> = Table::with_capacity(n);
+                    let mut ids = Vec::new();
+                    let mut slots = Vec::with_capacity(n);
+                    for (t, part) in lp_parts.iter().enumerate() {
+                        for &(h, r, pf, s) in &part[b] {
+                            let (v, new) = tab.slot(h);
+                            if new {
+                                *v = ids.len() as u32;
+                                ids.push((h, r, pf));
+                            }
+                            slots.push((t as u32, s, *v));
+                        }
                     }
-                    let Some(ts) = parse::timestamp(f[2]) else { break 'v };
+                    acc.push((b, Interned { ids, slots }));
+                },
+            );
+            let mut all: Vec<(usize, Interned)> = per.into_iter().flatten().collect();
+            all.sort_unstable_by_key(|x| x.0);
+            all.into_iter().map(|x| x.1).collect()
+        };
+        drop(lp_parts);
+        lap("links: parsed+interned");
+        let mut offs = vec![0u32; NB + 1];
+        for b in 0..NB {
+            offs[b + 1] = offs[b] + interned[b].ids.len() as u32;
+        }
+        let n_ids = offs[NB] as usize;
+        let mut edges: Vec<Vec<u32>> = lp_edges.iter().map(|&n| vec![0u32; n as usize * 2]).collect();
+        for (b, it) in interned.iter().enumerate() {
+            for &(t, s, l) in &it.slots {
+                edges[t as usize][s as usize] = offs[b] + l;
+            }
+        }
+        lap("links: edges");
+        let mut parent: Vec<u32> = (0..n_ids as u32).collect();
+        fn find(parent: &mut [u32], mut x: u32) -> u32 {
+            let mut r = x;
+            while parent[r as usize] != r {
+                r = parent[r as usize];
+            }
+            while parent[x as usize] != r {
+                let n = parent[x as usize];
+                parent[x as usize] = r;
+                x = n;
+            }
+            r
+        }
+        for e in &edges {
+            for pair in e.chunks_exact(2) {
+                let (x, y) = (find(&mut parent, pair[0]), find(&mut parent, pair[1]));
+                if x != y {
+                    // union by smaller index keeps trees shallow enough with compression
+                    if x < y {
+                        parent[y as usize] = x;
+                    } else {
+                        parent[x as usize] = y;
+                    }
+                }
+            }
+        }
+        drop(edges);
+        lap("links: union-find");
+        // Flat per-ID arrays in global index order.
+        let mut gid: Vec<(u64, u64, u64)> = Vec::with_capacity(n_ids);
+        for it in &interned {
+            gid.extend_from_slice(&it.ids);
+        }
+        // best[root] = member with the byte-wise smallest ID
+        let mut best: Vec<u32> = (0..n_ids as u32).collect();
+        for g in 0..n_ids as u32 {
+            let r = find(&mut parent, g);
+            if r != g {
+                let cur = best[r as usize];
+                let (a, c) = (&gid[g as usize], &gid[cur as usize]);
+                if a.2 < c.2 || (a.2 == c.2 && corpus.bytes(a.1) < corpus.bytes(c.1)) {
+                    best[r as usize] = g;
+                }
+            }
+        }
+        lap("links: names");
+        // Per ID bucket: ID hash -> (name hash, name ref).
+        let people: Vec<Table<(u64, u64)>> = {
+            let per = par(threads, NB, Vec::<(usize, Table<(u64, u64)>)>::new, |acc, b| {
+                let it = &interned[b];
+                let mut tab = Table::with_capacity(it.ids.len());
+                for (l, &(h, _, _)) in it.ids.iter().enumerate() {
+                    let g = offs[b] + l as u32;
+                    let n = &gid[best[parent[g as usize] as usize] as usize];
+                    tab.insert(h, (n.0, n.1));
+                }
+                acc.push((b, tab));
+            });
+            let mut all: Vec<_> = per.into_iter().flatten().collect();
+            all.sort_unstable_by_key(|x| x.0);
+            all.into_iter().map(|x| x.1).collect()
+        };
+        drop((interned, best, parent, gid));
+        lap(&format!("links: {n_ids} ids"));
+        people
+    };
+    let (people, ep_valid, ep_ids, cp) = std::thread::scope(|scope| {
+        let links = scope.spawn(links_job);
+        // ================================================================ events: parse
+        // Valid copies go to their user_id bucket in full; every copy also sends
+        // (event_id hash, ingest) to its event_id bucket for duplicate detection.
+        let est = event_bytes / 70 / NB / threads + 16;
+        let ep = par(
+            threads,
+            event_chunks.len(),
+            || (buckets::<ERec>(est + est / 4), buckets::<(u64, i32)>(est + est / 4)),
+            |(uk, dk), i| {
+                let c = event_chunks[i];
+                let data: &[u8] = &corpus.maps[c.file as usize];
+                parse::for_rows::<7>(data, c.start, c.end, |f| {
+                    if f[0].is_empty() {
+                        return;
+                    }
+                    let eh = hash(f[0]);
+                    let ingest_abs = parse::timestamp(f[3]).unwrap_or(i64::MAX);
+                    let ingest = ((ingest_abs.saturating_sub(t0)) / 1000).clamp(i32::MIN as i64, i32::MAX as i64) as i32;
+                    dk[bucket(eh)].push((eh, ingest));
+                    if f[1].is_empty() || f[5].is_empty() {
+                        return;
+                    }
+                    let Some(ts) = parse::timestamp(f[2]) else { return };
                     if ts < ws || ts >= we {
-                        break 'v;
+                        return;
                     }
                     let mut price = 0u32;
                     match f[4] {
                         b"view" | b"cart" => {}
                         b"purchase" => match parse::price(f[6]) {
                             Some(p) => price = p,
-                            None => break 'v,
+                            None => return,
                         },
-                        _ => break 'v,
+                        _ => return,
                     }
                     if ingest_abs.saturating_sub(ts) > LATE {
-                        break 'v;
+                        return;
                     }
                     let cat = products_lookup(f[5]);
-                    r.uh = hash(f[1]);
-                    r.uref = corpus.rf(c.file, f[1]);
-                    r.ts = (ts - t0) as u32;
-                    r.pc = price | (cat << 24);
-                }
-                bk[bucket(eh)].push(r);
-            });
-        },
-    );
-    lap("events parsed");
+                    let uh = hash(f[1]);
+                    uk[bucket(uh)].push(ERec { eh, uh, uref: corpus.rf(c.file, f[1]), ts: (ts - t0) as u32, ingest, pc: price | (cat << 24) });
+                });
+            },
+        );
+        let (ep_valid, ep_ids): (Vec<_>, Vec<_>) = ep.into_iter().unzip();
+        lap("events parsed");
 
-    // ================================================================ clicks: parse
-    let est = click_bytes / 40 / NB / threads + 16;
-    let cp = par(
-        threads,
-        click_chunks.len(),
-        || buckets::<Ck>(est + est / 4),
-        |bk, i| {
-            let c = click_chunks[i];
-            let data: &[u8] = &corpus.maps[c.file as usize];
-            parse::for_rows::<4>(data, c.start, c.end, |f| {
-                if f[0].is_empty() || f[1].is_empty() || f[2].is_empty() {
-                    return;
-                }
-                let Some(camp) = camp_tab.get(hash(f[2])) else { return };
-                let Some(ts) = parse::timestamp(f[3]) else { return };
-                if ts < t0 || ts >= we {
-                    return;
-                }
-                let uh = hash(f[1]);
-                bk[bucket(uh)].push(Ck { key: uh, cid: corpus.rf(c.file, f[0]), ts: (ts - t0) as u32, camp });
-            });
-        },
-    );
-    lap("clicks parsed");
+        // ================================================================ clicks: parse
+        let est = click_bytes / 40 / NB / threads + 16;
+        let cp = par(
+            threads,
+            click_chunks.len(),
+            || buckets::<Ck>(est + est / 4),
+            |bk, i| {
+                let c = click_chunks[i];
+                let data: &[u8] = &corpus.maps[c.file as usize];
+                parse::for_rows::<4>(data, c.start, c.end, |f| {
+                    if f[0].is_empty() || f[1].is_empty() || f[2].is_empty() {
+                        return;
+                    }
+                    let Some(camp) = camp_tab.get(hash(f[2])) else { return };
+                    let Some(ts) = parse::timestamp(f[3]) else { return };
+                    if ts < t0 || ts >= we {
+                        return;
+                    }
+                    let uh = hash(f[1]);
+                    bk[bucket(uh)].push(Ck { key: uh, cid: corpus.rf(c.file, f[0]), ts: (ts - t0) as u32, camp });
+                });
+            },
+        );
+        lap("clicks parsed");
+        (links.join().unwrap(), ep_valid, ep_ids, cp)
+    });
 
-    // ================================================================ dedup per event_id bucket
-    // Second-level partition by the next 8 bits, so each group's table is tiny.
-    let dp = par(
+    // ================================================================ duplicate event_ids
+    // Per event_id bucket (second-level groups keep tables tiny): every
+    // event_id seen more than once, with its smallest ingest.
+    let dups_found = par(
         threads,
         NB,
-        || (buckets::<Ev>(0), (0..256).map(|_| Vec::<ERec>::new()).collect::<Vec<_>>(), Table::<u32>::with_capacity(4096)),
-        |(out, groups, tab), b| {
-            for r in gather(&ep, b) {
-                groups[((r.eh >> 48) & 255) as usize].push(*r);
+        || {
+            (
+                Vec::<(usize, Vec<(u64, i32)>)>::new(),
+                (0..256).map(|_| Vec::<(u64, i32)>::new()).collect::<Vec<_>>(),
+                Table::<(i32, u32)>::with_capacity(4096),
+            )
+        },
+        |(acc, groups, tab), b| {
+            for &(eh, ing) in gather(&ep_ids, b) {
+                groups[((eh >> 48) & 255) as usize].push((eh, ing));
             }
+            let mut found = Vec::new();
             for grp in groups.iter_mut() {
-                if grp.is_empty() {
+                if grp.len() < 2 {
+                    grp.clear();
                     continue;
                 }
                 let need = (grp.len() * 2).next_power_of_two().max(8);
@@ -619,37 +635,77 @@ fn main() {
                 } else {
                     tab.slots.iter_mut().for_each(|s| s.0 = 0);
                 }
-                for (i, r) in grp.iter().enumerate() {
-                    let (v, new) = tab.slot(r.eh);
-                    if new || r.ingest < grp[*v as usize].ingest {
-                        *v = i as u32;
+                for &(eh, ing) in grp.iter() {
+                    let (v, new) = tab.slot(eh);
+                    if new {
+                        *v = (ing, 1);
+                    } else {
+                        v.0 = v.0.min(ing);
+                        v.1 += 1;
                     }
                 }
                 for s in &tab.slots {
-                    if s.0 != 0 {
-                        let r = &grp[s.1 as usize];
-                        if r.ts != INVALID {
-                            out[bucket(r.uh)].push(Ev { key: r.uh, r: r.uref, ts: r.ts, pc: r.pc });
-                        }
+                    if s.0 != 0 && s.1 .1 > 1 {
+                        found.push((s.0, s.1 .0));
                     }
                 }
                 grp.clear();
             }
+            acc.push((b, found));
         },
     );
-    drop(ep);
-    let dp: Vec<Vec<Vec<Ev>>> = dp.into_iter().map(|s| s.0).collect();
-    lap("deduped");
+    drop(ep_ids);
+    let mut dup_lists: Vec<Vec<(u64, i32)>> = (0..NB).map(|_| Vec::new()).collect();
+    for (b, v) in dups_found.into_iter().flat_map(|s| s.0) {
+        dup_lists[b] = v;
+    }
+    let ndups: usize = dup_lists.iter().map(|v| v.len()).sum();
+    let dup_tabs: Vec<Table<i32>> = dup_lists
+        .iter()
+        .map(|v| {
+            let mut t = Table::with_capacity(v.len());
+            for &(eh, ing) in v {
+                t.insert(eh, ing);
+            }
+            t
+        })
+        .collect();
+    // A one-bit-per-hash filter in front of dup_tabs, small enough for L2.
+    let bloom_bits = (ndups * 16).next_power_of_two().clamp(1 << 16, 1 << 27);
+    let bloom_mask = (bloom_bits - 1) as u64;
+    let mut bloom = vec![0u64; bloom_bits / 64];
+    for v in &dup_lists {
+        for &(eh, _) in v {
+            let k = (eh >> 20) & bloom_mask;
+            bloom[(k >> 6) as usize] |= 1 << (k & 63);
+        }
+    }
+    drop(dup_lists);
+    lap(&format!("duplicates: {ndups} event_ids"));
 
     // ================================================================ resolve people per user_id bucket
+    // Drops the losing copies of duplicated events (identical winning copies
+    // share a user_id, so they meet here and only one is kept).
     let rp = par(
         threads,
         NB,
-        || (buckets::<Ev>(0), buckets::<Ck>(0)),
-        |(eo, co), b| {
+        || (buckets::<Ev>(0), buckets::<Ck>(0), std::collections::HashSet::<u64>::new()),
+        |(eo, co, seen), b| {
             let tab = &people[b];
-            for e in gather(&dp, b) {
-                let (key, r) = tab.get(e.key).unwrap_or((e.key, e.r));
+            seen.clear();
+            for e in gather(&ep_valid, b) {
+                let k = (e.eh >> 20) & bloom_mask;
+                if bloom[(k >> 6) as usize] & (1 << (k & 63)) != 0 {
+                    if let Some(min) = dup_tabs[bucket(e.eh)].get(e.eh) {
+                        if e.ingest != min {
+                            continue;
+                        }
+                        if !seen.insert(e.eh) {
+                            continue;
+                        }
+                    }
+                }
+                let (key, r) = tab.get(e.uh).unwrap_or((e.uh, e.uref));
                 eo[bucket(key)].push(Ev { key, r, ts: e.ts, pc: e.pc });
             }
             for c in gather(&cp, b) {
@@ -658,9 +714,9 @@ fn main() {
             }
         },
     );
-    drop(dp);
+    drop(ep_valid);
     drop(cp);
-    let (ev_parts, ck_parts): (Vec<_>, Vec<_>) = rp.into_iter().unzip();
+    let (ev_parts, ck_parts): (Vec<_>, Vec<_>) = rp.into_iter().map(|(e, c, _)| (e, c)).unzip();
     lap("resolved");
 
     // ================================================================ per person bucket
@@ -681,44 +737,32 @@ fn main() {
             runs: Vec::new(),
             run_of: Vec::new(),
             by_camp: Vec::new(),
-            evs: Vec::new(),
-            cks: Vec::new(),
+            eg: Vec::new(),
+            cg: Vec::new(),
         },
         |w, b| {
-            let mut evs = std::mem::take(&mut w.evs);
-            evs.clear();
-            evs.extend(gather(&ev_parts, b).copied());
-            evs.sort_unstable_by_key(|e| (e.key, e.ts));
-            let mut cks = std::mem::take(&mut w.cks);
-            cks.clear();
-            cks.extend(gather(&ck_parts, b).copied());
-            cks.sort_unstable_by(|a, c| {
-                a.key
-                    .cmp(&c.key)
-                    .then(a.ts.cmp(&c.ts))
-                    .then_with(|| corpus.bytes(c.cid).cmp(corpus.bytes(a.cid)))
-            });
-            let mut ci = 0;
-            let mut i = 0;
-            while i < evs.len() {
-                let p = evs[i].key;
-                let mut j = i + 1;
-                while j < evs.len() && evs[j].key == p {
-                    j += 1;
-                }
-                while ci < cks.len() && cks[ci].key < p {
-                    ci += 1;
-                }
-                let mut cj = ci;
-                while cj < cks.len() && cks[cj].key == p {
-                    cj += 1;
-                }
-                w.person(&evs[i..j], &cks[ci..cj], &ctx);
-                ci = cj;
-                i = j;
+            // Second-level groups by person hash, so each sort runs in cache.
+            if w.eg.is_empty() {
+                w.eg = (0..256).map(|_| Vec::new()).collect();
+                w.cg = (0..256).map(|_| Vec::new()).collect();
             }
-            w.evs = evs;
-            w.cks = cks;
+            for e in gather(&ev_parts, b) {
+                w.eg[((e.key >> 48) & 255) as usize].push(*e);
+            }
+            for c in gather(&ck_parts, b) {
+                w.cg[((c.key >> 48) & 255) as usize].push(*c);
+            }
+            for g in 0..256 {
+                let mut evs = std::mem::take(&mut w.eg[g]);
+                let mut cks = std::mem::take(&mut w.cg[g]);
+                if !evs.is_empty() {
+                    w.group(&mut evs, &mut cks, &ctx, corpus);
+                }
+                evs.clear();
+                cks.clear();
+                w.eg[g] = evs;
+                w.cg[g] = cks;
+            }
         },
     );
     drop(ev_parts);
@@ -746,7 +790,8 @@ fn main() {
     let user_parts: Vec<Vec<URow>> = results.into_iter().map(|w| w.rows).collect();
     let nrows: usize = user_parts.iter().map(|v| v.len()).sum();
 
-    let octx = out::Ctx { corpus: &corpus, cats: &cats, campaigns: &campaigns, organic };
+    let cats: &'static [Vec<u8>] = Box::leak(cats.into_boxed_slice());
+    let octx = out::Ctx { corpus, cats, campaigns: &campaigns, organic };
     if csv_out {
         out::write_csv(&out_dir, &octx, &user_parts, &crows);
     } else {
@@ -775,11 +820,40 @@ struct Worker {
     runs: Vec<(u32, i32)>, // (first session index, day)
     run_of: Vec<u32>,
     by_camp: Vec<(u32, u32)>,
-    evs: Vec<Ev>,
-    cks: Vec<Ck>,
+    eg: Vec<Vec<Ev>>,
+    cg: Vec<Vec<Ck>>,
 }
 
 impl Worker {
+    fn group(&mut self, evs: &mut [Ev], cks: &mut [Ck], ctx: &PCtx, corpus: &Corpus) {
+        evs.sort_unstable_by_key(|e| (e.key, e.ts));
+        cks.sort_unstable_by(|a, c| {
+            a.key
+                .cmp(&c.key)
+                .then(a.ts.cmp(&c.ts))
+                .then_with(|| corpus.bytes(c.cid).cmp(corpus.bytes(a.cid)))
+        });
+        let mut ci = 0;
+        let mut i = 0;
+        while i < evs.len() {
+            let p = evs[i].key;
+            let mut j = i + 1;
+            while j < evs.len() && evs[j].key == p {
+                j += 1;
+            }
+            while ci < cks.len() && cks[ci].key < p {
+                ci += 1;
+            }
+            let mut cj = ci;
+            while cj < cks.len() && cks[cj].key == p {
+                cj += 1;
+            }
+            self.person(&evs[i..j], &cks[ci..cj], ctx);
+            ci = cj;
+            i = j;
+        }
+    }
+
     fn flush_day(&mut self, name: u64, day: i32, sessions: u32, events: u32, revenue: u64) {
         let mut top = u16::MAX;
         let mut best = 0u64;

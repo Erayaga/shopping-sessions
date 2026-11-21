@@ -13,6 +13,7 @@ memchr = "2"
 memmap2 = "0.9"
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
 parquet = { version = "54", default-features = false }
+bytes = "1"
 
 [profile.release]
 opt-level = 3
