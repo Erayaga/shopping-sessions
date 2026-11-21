@@ -692,7 +692,66 @@ unsafe fn masks64(p: *const u8) -> (u64, u64, u64) {
 /// twice the number of fields that start and end with a quote (and are at
 /// least two bytes long): any other quote breaks the equality.
 #[inline(always)]
-pub fn for_rows<'a, const N: usize>(data: &'a [u8], start: usize, end: usize, mut f: impl FnMut(&[&'a [u8]; N])) {
+pub fn for_rows<'a, const N: usize>(data: &'a [u8], start: usize, end: usize, f: impl FnMut(&[&'a [u8]; N])) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if use_avx512() {
+            // SAFETY: the CPU supports AVX-512F/BW (checked at run time).
+            return unsafe { for_rows_avx512::<N>(data, start, end, f) };
+        }
+    }
+    for_rows_impl::<N, false>(data, start, end, f)
+}
+
+/// AVX-512 is used when the CPU has it, unless SESSIONS_NO_AVX512 is set.
+#[cfg(target_arch = "x86_64")]
+#[inline]
+fn use_avx512() -> bool {
+    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FLAG.get_or_init(|| {
+        let on = std::is_x86_feature_detected!("avx512f")
+            && std::is_x86_feature_detected!("avx512bw")
+            && std::env::var_os("SESSIONS_NO_AVX512").is_none();
+        eprintln!("splitter: {}", if on { "avx512" } else { "avx2" });
+        on
+    })
+}
+
+/// The block scanner compiled with AVX-512 enabled (one 64-byte compare per mask).
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,avx512bw")]
+unsafe fn for_rows_avx512<'a, const N: usize>(data: &'a [u8], start: usize, end: usize, f: impl FnMut(&[&'a [u8]; N])) {
+    for_rows_impl::<N, true>(data, start, end, f)
+}
+
+/// Comma, newline and quote bitmasks of the 64 bytes at p, with AVX-512.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,avx512bw")]
+#[inline]
+unsafe fn masks64_512(p: *const u8) -> (u64, u64, u64) {
+    use std::arch::x86_64::*;
+    let v = _mm512_loadu_si512(p as *const _);
+    (
+        _mm512_cmpeq_epi8_mask(v, _mm512_set1_epi8(b',' as i8)),
+        _mm512_cmpeq_epi8_mask(v, _mm512_set1_epi8(b'\n' as i8)),
+        _mm512_cmpeq_epi8_mask(v, _mm512_set1_epi8(b'"' as i8)),
+    )
+}
+
+#[inline(always)]
+fn masks64_any<const W: bool>(p: *const u8) -> (u64, u64, u64) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if W {
+            // SAFETY: W is only true inside for_rows_avx512.
+            return unsafe { masks64_512(p) };
+        }
+    }
+    unsafe { masks64(p) }
+}
+
+#[inline(always)]
+fn for_rows_impl<'a, const N: usize, const W: bool>(data: &'a [u8], start: usize, end: usize, mut f: impl FnMut(&[&'a [u8]; N])) {
     let mut out: [&'a [u8]; N] = [&data[..0]; N];
     let mut commas = [0usize; N];
     let mut nc = 0usize; // commas seen in the current line (capped at N)
@@ -726,12 +785,12 @@ pub fn for_rows<'a, const N: usize>(data: &'a [u8], start: usize, end: usize, mu
     let mut buf: [u8; 64];
     while base < end {
         let (mut cm, mut nm, mut qm) = if base + 64 <= data.len() {
-            unsafe { masks64(data.as_ptr().add(base)) }
+            masks64_any::<W>(unsafe { data.as_ptr().add(base) })
         } else {
             let n = data.len() - base;
             buf = [0u8; 64];
             buf[..n].copy_from_slice(&data[base..]);
-            unsafe { masks64(buf.as_ptr()) }
+            masks64_any::<W>(buf.as_ptr())
         };
         if end - base < 64 {
             let keep = (1u64 << (end - base)) - 1;
