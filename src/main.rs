@@ -179,21 +179,16 @@ fn add_files(maps: &mut Vec<Mmap>, bases: &mut Vec<u64>, next: &mut u64, paths: 
             let _ = m.advise(memmap2::Advice::Sequential);
         }
         let file = maps.len() as u32;
-        let data: &[u8] = &m;
-        total += data.len();
-        if let Some(h) = memchr::memchr(b'\n', data) {
-            let mut start = h + 1;
-            while start < data.len() {
-                let mut end = (start + CHUNK).min(data.len());
-                if end < data.len() {
-                    end = match memchr::memchr(b'\n', &data[end..]) {
-                        Some(i) => end + i + 1,
-                        None => data.len(),
-                    };
-                }
-                chunks.push(Chunk { file, start, end });
-                start = end;
-            }
+        let ulen = len as usize;
+        total += ulen;
+        // Plain byte ranges: the main thread never touches file data (on a
+        // cold page cache that would read every file on one thread). Each
+        // worker finds its own line boundaries with `line_range`.
+        let mut start = 0;
+        while start < ulen {
+            let end = (start + CHUNK).min(ulen);
+            chunks.push(Chunk { file, start, end });
+            start = end;
         }
         bases.push(*next);
         *next += len + 1;
@@ -201,6 +196,25 @@ fn add_files(maps: &mut Vec<Mmap>, bases: &mut Vec<u64>, next: &mut u64, paths: 
     }
     // biggest first is not needed: chunks are all about CHUNK bytes
     (chunks, total)
+}
+
+/// The lines a chunk owns: those starting in [c.start, c.end), except the
+/// file's first line (its header).
+#[inline]
+fn line_range(data: &[u8], c: Chunk) -> (usize, usize) {
+    let adj = |x: usize| -> usize {
+        if x >= data.len() {
+            data.len()
+        } else if x == 0 {
+            memchr::memchr(b'\n', data).map_or(data.len(), |i| i + 1)
+        } else if data[x - 1] == b'\n' {
+            x
+        } else {
+            memchr::memchr(b'\n', &data[x..]).map_or(data.len(), |i| x + i + 1)
+        }
+    };
+    let (a, b) = (adj(c.start), adj(c.end));
+    (a, b.max(a))
 }
 
 /// Runs `f(state, i)` for i in 0..n on `threads` threads; returns the states.
@@ -480,6 +494,14 @@ fn main() {
     let (click_chunks, _click_bytes) = add_files(&mut maps, &mut bases, &mut next, &list_csv(&data_dir.join("clicks")));
     // Leaked: lives for the whole run, so output can borrow its bytes zero-copy.
     let corpus: &'static Corpus = Box::leak(Box::new(Corpus { maps, bases }));
+    // Ask the kernel to read every input file ahead, from a side thread, so a
+    // cold page cache streams at full disk speed while parsing runs.
+    #[cfg(unix)]
+    std::thread::spawn(move || {
+        for m in &corpus.maps {
+            let _ = m.advise(memmap2::Advice::WillNeed);
+        }
+    });
     lap("mapped");
 
     // Links don't feed parsing (people are resolved after it), so they run
@@ -495,7 +517,8 @@ fn main() {
             |(bk, nedges), i| {
                 let c = link_chunks[i];
                 let data: &[u8] = &corpus.maps[c.file as usize];
-                parse::for_rows::<2>(data, c.start, c.end, |f| {
+                let lr = line_range(data, c);
+                parse::for_rows::<2>(data, lr.0, lr.1, |f| {
                     if !f[0].is_empty() && !f[1].is_empty() {
                         let e = *nedges;
                         *nedges += 1;
@@ -638,7 +661,8 @@ fn main() {
                 if i >= ne_chunks {
                     let c = click_chunks[i - ne_chunks];
                     let data: &[u8] = &corpus.maps[c.file as usize];
-                    parse::for_rows::<4>(data, c.start, c.end, |f| {
+                    let lr = line_range(data, c);
+                    parse::for_rows::<4>(data, lr.0, lr.1, |f| {
                         if f[0].is_empty() || f[1].is_empty() || f[2].is_empty() {
                             return;
                         }
@@ -654,7 +678,8 @@ fn main() {
                 }
                 let c = event_chunks[i];
                 let data: &[u8] = &corpus.maps[c.file as usize];
-                parse::for_rows::<7>(data, c.start, c.end, |f| {
+                let lr = line_range(data, c);
+                parse::for_rows::<7>(data, lr.0, lr.1, |f| {
                     if f[0].is_empty() {
                         return;
                     }
