@@ -140,7 +140,7 @@ pub fn next_line<'a, const N: usize>(data: &'a [u8], start: usize, end: usize, o
 
 /// Calls f for every well-formed row among the lines in data[start..end].
 #[inline(always)]
-pub fn for_rows<'a, const N: usize>(data: &'a [u8], start: usize, end: usize, mut f: impl FnMut(&[&'a [u8]; N])) {
+pub fn for_rows_ref<'a, const N: usize>(data: &'a [u8], start: usize, end: usize, mut f: impl FnMut(&[&'a [u8]; N])) {
     let mut out: [&'a [u8]; N] = [&data[..0]; N];
     let mut p = start;
     while p < end {
@@ -648,5 +648,194 @@ mod swar_tests {
             }
         }
         assert!(checked > 0);
+    }
+}
+
+
+// ---------------------------------------------------------------- block scanning
+/// Comma, newline and quote bitmasks of the 64 bytes at p.
+#[cfg(target_feature = "avx2")]
+#[inline(always)]
+unsafe fn masks64(p: *const u8) -> (u64, u64, u64) {
+    use std::arch::x86_64::*;
+    let lo = _mm256_loadu_si256(p as *const __m256i);
+    let hi = _mm256_loadu_si256(p.add(32) as *const __m256i);
+    let m = |v: __m256i, c: u8| _mm256_movemask_epi8(_mm256_cmpeq_epi8(v, _mm256_set1_epi8(c as i8))) as u32 as u64;
+    (
+        m(lo, b',') | (m(hi, b',') << 32),
+        m(lo, b'\n') | (m(hi, b'\n') << 32),
+        m(lo, b'"') | (m(hi, b'"') << 32),
+    )
+}
+
+#[cfg(not(target_feature = "avx2"))]
+#[inline(always)]
+unsafe fn masks64(p: *const u8) -> (u64, u64, u64) {
+    let (mut c, mut n, mut q) = (0u64, 0u64, 0u64);
+    for i in 0..64 {
+        let b = *p.add(i);
+        c |= ((b == b',') as u64) << i;
+        n |= ((b == b'\n') as u64) << i;
+        q |= ((b == b'"') as u64) << i;
+    }
+    (c, n, q)
+}
+
+/// Calls f for every well-formed row among the lines in data[start..end].
+/// Scans 64-byte blocks once and walks separator bits across lines. A line
+/// is well-formed when it has exactly N-1 commas and its quote count equals
+/// twice the number of fields that start and end with a quote (and are at
+/// least two bytes long): any other quote breaks the equality.
+#[inline(always)]
+pub fn for_rows<'a, const N: usize>(data: &'a [u8], start: usize, end: usize, mut f: impl FnMut(&[&'a [u8]; N])) {
+    let mut out: [&'a [u8]; N] = [&data[..0]; N];
+    let mut commas = [0usize; N];
+    let mut nc = 0usize; // commas seen in the current line (capped at N)
+    let mut nq = 0u32; // quotes seen in the current line
+    let mut line = start;
+    let mut emit = |line: usize, nl: usize, commas: &[usize; N], nc: usize, nq: u32, out: &mut [&'a [u8]; N]| {
+        if nc != N - 1 {
+            return;
+        }
+        let mut quoted = 0u32;
+        let mut a = line;
+        for i in 0..N {
+            let b = if i + 1 < N { commas[i] } else { nl };
+            let (mut fa, mut fb) = (a, b);
+            if nq != 0 && b > a && data[a] == b'"' {
+                if b - a < 2 || data[b - 1] != b'"' {
+                    return;
+                }
+                quoted += 1;
+                fa += 1;
+                fb -= 1;
+            }
+            out[i] = &data[fa..fb];
+            a = b + 1;
+        }
+        if nq == 2 * quoted {
+            f(out);
+        }
+    };
+    let mut base = start;
+    let mut buf = [0u8; 64];
+    while base < end {
+        let (mut cm, mut nm, mut qm) = if base + 64 <= data.len() {
+            unsafe { masks64(data.as_ptr().add(base)) }
+        } else {
+            let n = data.len() - base;
+            buf = [0u8; 64];
+            buf[..n].copy_from_slice(&data[base..]);
+            unsafe { masks64(buf.as_ptr()) }
+        };
+        if end - base < 64 {
+            let keep = (1u64 << (end - base)) - 1;
+            cm &= keep;
+            nm &= keep;
+            qm &= keep;
+        }
+        let mut sep = cm | nm;
+        while sep != 0 {
+            let bit = sep.trailing_zeros();
+            let pos = base + bit as usize;
+            if (nm >> bit) & 1 != 0 {
+                // quotes up to this newline belong to the line
+                let upto = if bit == 63 { u64::MAX } else { (1u64 << (bit + 1)) - 1 };
+                nq += (qm & upto).count_ones();
+                qm &= !upto;
+                emit(line, pos, &commas, nc, nq, &mut out);
+                line = pos + 1;
+                nc = 0;
+                nq = 0;
+            } else {
+                if nc < N - 1 {
+                    commas[nc] = pos;
+                }
+                nc = (nc + 1).min(N);
+            }
+            sep &= sep - 1;
+        }
+        nq += qm.count_ones();
+        base += 64;
+    }
+    if line < end {
+        emit(line, end, &commas, nc, nq, &mut out);
+    }
+}
+
+#[cfg(test)]
+mod block_tests {
+    use super::*;
+
+    fn rows<const N: usize>(data: &[u8], start: usize, end: usize, block: bool) -> Vec<Vec<Vec<u8>>> {
+        let mut v = Vec::new();
+        let mut push = |r: &[&[u8]; N]| v.push(r.iter().map(|x| x.to_vec()).collect());
+        if block {
+            for_rows::<N>(data, start, end, &mut push);
+        } else {
+            for_rows_ref::<N>(data, start, end, &mut push);
+        }
+        v
+    }
+
+    /// The block scanner yields exactly the rows of the per-line splitter.
+    #[test]
+    fn block_matches_reference() {
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut rnd = |n: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed % n
+        };
+        let alphabet = b"ab\",,\r 1Z\"\n";
+        for round in 0..400 {
+            let mut buf = Vec::new();
+            let lines = rnd(300) as usize;
+            for _ in 0..lines {
+                if rnd(3) == 0 {
+                    // random garbage line
+                    for _ in 0..rnd(150) {
+                        let r = rnd(100);
+                        buf.push(if r < 55 { b'a' + (r % 26) as u8 } else { alphabet[(r % alphabet.len() as u64) as usize] });
+                    }
+                } else {
+                    let nf = if rnd(8) == 0 { rnd(9) as usize } else { 4 };
+                    for k in 0..nf {
+                        if k > 0 {
+                            buf.push(b',');
+                        }
+                        let q = rnd(4) == 0;
+                        if q {
+                            buf.push(b'"');
+                        }
+                        for _ in 0..rnd(40) {
+                            buf.push(b'a' + rnd(26) as u8);
+                        }
+                        if rnd(30) == 0 {
+                            buf.push(b'"');
+                        }
+                        if q && rnd(10) != 0 {
+                            buf.push(b'"');
+                        }
+                    }
+                }
+                buf.push(b'\n');
+            }
+            if rnd(2) == 0 {
+                buf.pop(); // last line without a newline
+            }
+            // sometimes end exactly at the data end, sometimes leave padding
+            if round % 2 == 0 {
+                buf.extend_from_slice(&[b'x'; 70]);
+                let end = buf.len() - 70;
+                assert_eq!(rows::<4>(&buf, 0, end, true), rows::<4>(&buf, 0, end, false));
+                assert_eq!(rows::<2>(&buf, 0, end, true), rows::<2>(&buf, 0, end, false));
+            } else {
+                let end = buf.len();
+                assert_eq!(rows::<4>(&buf, 0, end, true), rows::<4>(&buf, 0, end, false));
+                assert_eq!(rows::<7>(&buf, 0, end, true), rows::<7>(&buf, 0, end, false));
+            }
+        }
     }
 }
