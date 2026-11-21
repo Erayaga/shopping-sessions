@@ -229,6 +229,57 @@ where
     })
 }
 
+/// A set of u64 keys (never 0) reused across buckets, reset by its used slots.
+#[derive(Default)]
+struct LocalSet {
+    slots: Vec<u64>,
+    used: Vec<u32>,
+}
+
+impl LocalSet {
+    fn reset(&mut self, expect: usize) {
+        for &i in &self.used {
+            self.slots[i as usize] = 0;
+        }
+        self.used.clear();
+        let want = (expect.max(16) * 2).next_power_of_two();
+        if self.slots.len() < want {
+            self.slots = vec![0; want];
+        }
+    }
+    /// True if k was not in the set.
+    #[inline(always)]
+    fn insert(&mut self, k: u64) -> bool {
+        if self.used.len() * 2 >= self.slots.len() {
+            let keys: Vec<u64> = self.used.iter().map(|&i| self.slots[i as usize]).collect();
+            let n = self.slots.len() * 2;
+            self.slots = vec![0; n];
+            self.used.clear();
+            for k in keys {
+                self.insert(k);
+            }
+        }
+        let mask = self.slots.len() - 1;
+        let mut i = (k as usize) & mask;
+        loop {
+            let s = self.slots[i];
+            if s == k {
+                return false;
+            }
+            if s == 0 {
+                self.slots[i] = k;
+                self.used.push(i as u32);
+                return true;
+            }
+            i = (i + 1) & mask;
+        }
+    }
+}
+
+fn part_len<T: Copy>(parts: &[Parts<T>], b: usize) -> usize {
+    parts.iter().map(|p| p.segs[b].len()).sum()
+}
+
 /// NB output vectors per thread, each pre-sized.
 fn buckets<T>(cap: usize) -> Vec<Vec<T>> {
     (0..NB).map(|_| Vec::with_capacity(cap)).collect()
@@ -267,24 +318,30 @@ fn bucket_len_v<T>(parts: &[Vec<Vec<T>>], b: usize) -> usize {
 }
 
 // ------------------------------------------------------------------ records
-/// An event copy as parsed. `ts == INVALID` marks a copy that fails
-/// validation (it still takes part in dedup).
+/// A valid event copy, in its user_id bucket. Its position there (thread,
+/// bucket, index) is what duplicate detection refers to.
 #[derive(Clone, Copy, Default)]
 struct ERec {
-    eh: u64,
     uh: u64,
     uref: u64,
-    ts: u32,     // ms since t0 = window_start - 7 days
-    ingest: i32, // seconds since t0, saturated
-    pc: u32,     // price (24 bits) | category << 24; price 0 = not a purchase
+    ts: u32, // ms since t0 = window_start - 7 days
+    pc: u32, // price (24 bits) | category << 24; price 0 = not a purchase
 }
 
-/// A surviving event: key is the user_id hash, then the person hash once
-/// resolved; r is the user_id ref, then the person's name ref.
+/// Every event copy, for duplicate detection: loc is the position of its
+/// ERec (thread << 28 | bucket << 20 | index), NOLOC for an invalid copy.
+#[derive(Clone, Copy, Default)]
+struct DRec {
+    eh: u64,
+    ingest: i32, // seconds since t0, saturated
+    loc: u32,
+}
+const NOLOC: u32 = u32::MAX;
+
+/// A surviving event in its person bucket (the name travels separately).
 #[derive(Clone, Copy)]
 struct Ev {
     key: u64,
-    r: u64,
     ts: u32,
     pc: u32,
 }
@@ -563,16 +620,18 @@ fn main() {
         lap(&format!("links: {n_ids} ids"));
         people
     };
+    assert!(threads <= 16, "locations pack the thread into 4 bits");
     let (people, ep_valid, ep_ids, cp) = std::thread::scope(|scope| {
         let links = scope.spawn(links_job);
+        let tids = AtomicUsize::new(0);
         // ================================================================ events: parse
         // Valid copies go to their user_id bucket in full; every copy also sends
         // (event_id hash, ingest) to its event_id bucket for duplicate detection.
         let ep = par_fin(
             threads,
             event_chunks.len(),
-            || (Parts::<ERec>::new(NB), Parts::<(u64, i32)>::new(NB)),
-            |(uk, dk), i| {
+            || (Parts::<ERec>::new(NB), Parts::<DRec>::new(NB), tids.fetch_add(1, Ordering::Relaxed) as u32),
+            |(uk, dk, tid), i| {
                 let c = event_chunks[i];
                 let data: &[u8] = &corpus.maps[c.file as usize];
                 parse::for_rows::<7>(data, c.start, c.end, |f| {
@@ -582,34 +641,48 @@ fn main() {
                     let eh = hash(f[0]);
                     let ingest_abs = parse::timestamp(f[3]).unwrap_or(i64::MAX);
                     let ingest = ((ingest_abs.saturating_sub(t0)) / 1000).clamp(i32::MIN as i64, i32::MAX as i64) as i32;
-                    dk.push(bucket(eh), (eh, ingest));
-                    if f[1].is_empty() || f[5].is_empty() {
-                        return;
-                    }
-                    let Some(ts) = parse::timestamp(f[2]) else { return };
-                    if ts < ws || ts >= we {
-                        return;
-                    }
-                    let mut price = 0u32;
-                    match f[4] {
-                        b"view" | b"cart" => {}
-                        b"purchase" => match parse::price(f[6]) {
-                            Some(p) => price = p,
-                            None => return,
-                        },
-                        _ => return,
-                    }
-                    if ingest_abs.saturating_sub(ts) > LATE {
-                        return;
-                    }
-                    let cat = products_lookup(f[5]);
-                    let uh = hash(f[1]);
-                    uk.push(bucket(uh), ERec { eh, uh, uref: corpus.rf(c.file, f[1]), ts: (ts - t0) as u32, ingest, pc: price | (cat << 24) });
+                    let valid = (|| {
+                        if f[1].is_empty() || f[5].is_empty() {
+                            return None;
+                        }
+                        let ts = parse::timestamp(f[2])?;
+                        if ts < ws || ts >= we {
+                            return None;
+                        }
+                        let price = match f[4] {
+                            b"view" | b"cart" => 0,
+                            b"purchase" => parse::price(f[6])?,
+                            _ => return None,
+                        };
+                        if ingest_abs.saturating_sub(ts) > LATE {
+                            return None;
+                        }
+                        Some((ts, price))
+                    })();
+                    let loc = match valid {
+                        Some((ts, price)) => {
+                            let cat = products_lookup(f[5]);
+                            let uh = hash(f[1]);
+                            let b = bucket(uh);
+                            let idx = uk.segs[b].count();
+                            assert!(idx < 1 << 20, "location index overflow");
+                            uk.push(b, ERec { uh, uref: corpus.rf(c.file, f[1]), ts: (ts - t0) as u32, pc: price | (cat << 24) });
+                            (*tid << 28) | ((b as u32) << 20) | idx as u32
+                        }
+                        None => NOLOC,
+                    };
+                    dk.push(bucket(eh), DRec { eh, ingest, loc });
                 });
             },
-            |(uk, dk)| { uk.finish(); dk.finish(); },
+            |(uk, dk, _)| {
+                uk.finish();
+                dk.finish();
+            },
         );
-        let (ep_valid, ep_ids): (Vec<_>, Vec<_>) = ep.into_iter().unzip();
+        // Locations name the producing thread by its id: order outputs by it.
+        let mut ep = ep;
+        ep.sort_unstable_by_key(|x| x.2);
+        let (ep_valid, ep_ids): (Vec<_>, Vec<_>) = ep.into_iter().map(|(u, d, _)| (u, d)).unzip();
         lap("events parsed");
 
         // ================================================================ clicks: parse
@@ -640,23 +713,24 @@ fn main() {
     });
 
     // ================================================================ duplicate event_ids
-    // Per event_id bucket (second-level groups keep tables tiny): every
-    // event_id seen more than once, with its smallest ingest.
-    let dups_found = par(
+    // Per event_id bucket (second-level groups keep tables tiny): for every
+    // event_id seen more than once, keep the first valid copy with the
+    // smallest ingest (equal-ingest copies are identical) and send the
+    // locations of all other valid copies to their user_id bucket.
+    let dl = par(
         threads,
         NB,
         || {
             (
-                Vec::<(usize, Vec<(u64, i32)>)>::new(),
-                (0..256).map(|_| Vec::<(u64, i32)>::new()).collect::<Vec<_>>(),
+                (0..NB).map(|_| Vec::<u32>::new()).collect::<Vec<_>>(),
+                (0..256).map(|_| Vec::<DRec>::new()).collect::<Vec<_>>(),
                 Table::<(i32, u32)>::with_capacity(4096),
             )
         },
-        |(acc, groups, tab), b| {
-            for &(eh, ing) in gather(&ep_ids, b) {
-                groups[((eh >> 48) & 255) as usize].push((eh, ing));
+        |(out, groups, tab), b| {
+            for r in gather(&ep_ids, b) {
+                groups[((r.eh >> 48) & 255) as usize].push(*r);
             }
-            let mut found = Vec::new();
             for grp in groups.iter_mut() {
                 if grp.len() < 2 {
                     grp.clear();
@@ -668,90 +742,72 @@ fn main() {
                 } else {
                     tab.slots.iter_mut().for_each(|s| s.0 = 0);
                 }
-                for &(eh, ing) in grp.iter() {
-                    let (v, new) = tab.slot(eh);
+                for r in grp.iter() {
+                    let (v, new) = tab.slot(r.eh);
                     if new {
-                        *v = (ing, 1);
+                        *v = (r.ingest, 1);
                     } else {
-                        v.0 = v.0.min(ing);
+                        v.0 = v.0.min(r.ingest);
                         v.1 += 1;
                     }
                 }
-                for s in &tab.slots {
-                    if s.0 != 0 && s.1 .1 > 1 {
-                        found.push((s.0, s.1 .0));
+                for r in grp.iter() {
+                    if r.loc == NOLOC {
+                        continue;
+                    }
+                    let (v, _) = tab.slot(r.eh);
+                    if v.1 & 0x7fff_ffff < 2 {
+                        continue; // not duplicated
+                    }
+                    if r.ingest == v.0 && v.1 & 0x8000_0000 == 0 {
+                        v.1 |= 0x8000_0000; // the kept copy
+                    } else {
+                        out[((r.loc >> 20) & 0xff) as usize].push(r.loc);
                     }
                 }
                 grp.clear();
             }
-            acc.push((b, found));
         },
     );
     drop(ep_ids);
-    let mut dup_lists: Vec<Vec<(u64, i32)>> = (0..NB).map(|_| Vec::new()).collect();
-    for (b, v) in dups_found.into_iter().flat_map(|s| s.0) {
-        dup_lists[b] = v;
-    }
-    let ndups: usize = dup_lists.iter().map(|v| v.len()).sum();
-    let dup_tabs: Vec<Table<i32>> = dup_lists
-        .iter()
-        .map(|v| {
-            let mut t = Table::with_capacity(v.len());
-            for &(eh, ing) in v {
-                t.insert(eh, ing);
-            }
-            t
-        })
-        .collect();
-    // A one-bit-per-hash filter in front of dup_tabs, small enough for L2.
-    let bloom_bits = (ndups * 16).next_power_of_two().clamp(1 << 16, 1 << 27);
-    let bloom_mask = (bloom_bits - 1) as u64;
-    let mut bloom = vec![0u64; bloom_bits / 64];
-    for v in &dup_lists {
-        for &(eh, _) in v {
-            let k = (eh >> 20) & bloom_mask;
-            bloom[(k >> 6) as usize] |= 1 << (k & 63);
-        }
-    }
-    drop(dup_lists);
-    lap(&format!("duplicates: {ndups} event_ids"));
+    let losers: Vec<Vec<Vec<u32>>> = dl.into_iter().map(|d| d.0).collect();
+    let nlosers: usize = losers.iter().flatten().map(|v| v.len()).sum();
+    lap(&format!("duplicates: {nlosers} losing copies"));
 
     // ================================================================ resolve people per user_id bucket
-    // Drops the losing copies of duplicated events (identical winning copies
-    // share a user_id, so they meet here and only one is kept).
+    // Skips the losing copies (by position), resolves each user_id to its
+    // person, and sends each person's name once per bucket on a side stream.
     let rp = par_fin(
         threads,
         NB,
-        || (Parts::<Ev>::new(NB), Parts::<Ck>::new(NB), std::collections::HashSet::<u64>::new()),
-        |(eo, co, seen), b| {
+        || (Parts::<Ev>::new(NB), Parts::<Ck>::new(NB), Parts::<(u64, u64)>::new(NB), LocalSet::default(), Vec::<Vec<u64>>::new()),
+        |(eo, co, no, seen, bits), b| {
             let tab = &people[b];
-            seen.clear();
-            // Duplicate-table lookups miss the cache: D records ahead, check the
-            // filter and prefetch the slot of likely duplicates.
-            const D: usize = 16;
-            for part in &ep_valid {
-                for sl in part.segs[b].slices() {
-                    for i in 0..sl.len() {
-                        if let Some(a) = sl.get(i + D) {
-                            let k = (a.eh >> 20) & bloom_mask;
-                            if bloom[(k >> 6) as usize] & (1 << (k & 63)) != 0 {
-                                dup_tabs[bucket(a.eh)].prefetch(a.eh);
-                            }
-                        }
-                        let e = &sl[i];
-                        let k = (e.eh >> 20) & bloom_mask;
-                        if bloom[(k >> 6) as usize] & (1 << (k & 63)) != 0 {
-                            if let Some(min) = dup_tabs[bucket(e.eh)].get(e.eh) {
-                                if e.ingest != min {
-                                    continue;
-                                }
-                                if !seen.insert(e.eh) {
-                                    continue;
-                                }
-                            }
-                        }
-                        let (key, r) = tab.get(e.uh).unwrap_or((e.uh, e.uref));
-                        eo.push(bucket(key), Ev { key, r, ts: e.ts, pc: e.pc });
+            // loser bitmaps per producing thread
+            bits.resize(ep_valid.len(), Vec::new());
+            for (t, part) in ep_valid.iter().enumerate() {
+                let w = part.segs[b].len().div_ceil(64);
+                bits[t].clear();
+                bits[t].resize(w, 0);
+            }
+            for t in &losers {
+                for &loc in &t[b] {
+                    let (th, i) = ((loc >> 28) as usize, (loc & 0xf_ffff) as usize);
+                    bits[th][i >> 6] |= 1 << (i & 63);
+                }
+            }
+            seen.reset(part_len(&ep_valid, b) / 8);
+            for (t, part) in ep_valid.iter().enumerate() {
+                let bt = &bits[t];
+                for (i, e) in part.segs[b].iter().enumerate() {
+                    if bt[i >> 6] & (1 << (i & 63)) != 0 {
+                        continue;
+                    }
+                    let (key, r) = tab.get(e.uh).unwrap_or((e.uh, e.uref));
+                    let pb = bucket(key);
+                    eo.push(pb, Ev { key, ts: e.ts, pc: e.pc });
+                    if seen.insert(key) {
+                        no.push(pb, (key, r));
                     }
                 }
             }
@@ -760,11 +816,23 @@ fn main() {
                 co.push(bucket(key), Ck { key, ..*c });
             }
         },
-        |(eo, co, _)| { eo.finish(); co.finish(); },
+        |(eo, co, no, _, _)| {
+            eo.finish();
+            co.finish();
+            no.finish();
+        },
     );
     drop(ep_valid);
     drop(cp);
-    let (ev_parts, ck_parts): (Vec<_>, Vec<_>) = rp.into_iter().map(|(e, c, _)| (e, c)).unzip();
+    drop(losers);
+    let mut ev_parts = Vec::new();
+    let mut ck_parts = Vec::new();
+    let mut nm_parts = Vec::new();
+    for (e, c, n, _, _) in rp {
+        ev_parts.push(e);
+        ck_parts.push(c);
+        nm_parts.push(n);
+    }
     lap("resolved");
 
     // ================================================================ per person bucket
@@ -801,7 +869,7 @@ fn main() {
             ccnt: Vec::new(),
         },
         |w, b| {
-            w.bucket(&ev_parts, &ck_parts, b, &ctx, corpus);
+            w.bucket(&ev_parts, &ck_parts, &nm_parts, b, &ctx, corpus);
         },
         |w| {
             // Overlaps with the threads still working on buckets.
@@ -894,10 +962,22 @@ impl Worker {
     /// One person bucket: a local table numbers the persons, counts give each
     /// one a contiguous range, a single scatter fills it, and only each
     /// person's own events are then sorted by time.
-    fn bucket(&mut self, ev_parts: &[Parts<Ev>], ck_parts: &[Parts<Ck>], b: usize, ctx: &PCtx, corpus: &Corpus) {
+    fn bucket(
+        &mut self,
+        ev_parts: &[Parts<Ev>],
+        ck_parts: &[Parts<Ck>],
+        nm_parts: &[Parts<(u64, u64)>],
+        b: usize,
+        ctx: &PCtx,
+        corpus: &Corpus,
+    ) {
         let ne: usize = ev_parts.iter().map(|p| p.segs[b].len()).sum();
         if ne == 0 {
             return;
+        }
+        let mut names: Table<u64> = Table::with_capacity(part_len(nm_parts, b));
+        for &(k, r) in gather(nm_parts, b) {
+            names.insert(k, r);
         }
         // Sized for ~4 events per person (they average far more); grows if
         // needed. Kept between buckets and reset by its used slots only.
@@ -1021,7 +1101,8 @@ impl Worker {
                 ck.sort_unstable_by(|a, c| a.ts.cmp(&c.ts).then_with(|| corpus.bytes(c.cid).cmp(corpus.bytes(a.cid))));
             }
             let (ev, ck) = (&es[cnt[p] as usize..cnt[p + 1] as usize], &cs[ccnt[p] as usize..ccnt[p + 1] as usize]);
-            self.person(ev, ck, ctx);
+            let name = names.get(ev[0].key).expect("every person has a name");
+            self.person(name, ev, ck, ctx);
         }
         // reset the used slots: each person's key is still in its slot
         for p in 0..np {
@@ -1057,8 +1138,7 @@ impl Worker {
         self.rows.push(URow { name, day, sessions, events, revenue, top });
     }
 
-    fn person(&mut self, evs: &[Ev], cks: &[Ck], cx: &PCtx) {
-        let name = evs[0].r;
+    fn person(&mut self, name: u64, evs: &[Ev], cks: &[Ck], cx: &PCtx) {
         let ndays = cx.ndays;
         self.starts.clear();
         self.runs.clear();

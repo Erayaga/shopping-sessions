@@ -15,6 +15,6 @@ export MSYS_NO_PATHCONV=1 PATH="$PATH:/c/Program Files/Docker/Docker/resources/b
 ROOT=$(pwd -W 2>/dev/null || pwd)
 ANS=$(cd ../shopping-sessions-files/dev-answer/dev-answer && (pwd -W 2>/dev/null || pwd))
 printf "parquet dev-answer: "
-docker run --rm -v "$ROOT:/w" -v "$ANS:/ans:ro" -v sessions-target:/w/target -w /w -e DATA_DIR=dev -e OUTPUT_DIR=/tmp/o sessions-check sh -c 'target/release/sessions 2>/dev/null && python scripts/compare.py /tmp/o /ans | tail -1'
+docker run --rm --ulimit core=0 -v "$ROOT:/w" -v "$ANS:/ans:ro" -v sessions-target:/w/target -w /w -e DATA_DIR=dev -e OUTPUT_DIR=/tmp/o sessions-check sh -c 'target/release/sessions 2>/dev/null && python scripts/compare.py /tmp/o /ans | tail -1'
 printf "parquet fixtures: "
-docker run --rm -v "$ROOT:/w" -v sessions-target:/w/target -w /w sessions-check python scripts/run_fixtures.py fixtures -- target/release/sessions 2>&1 | tail -1
+docker run --rm --ulimit core=0 -v "$ROOT:/w" -v sessions-target:/w/target -w /w sessions-check python scripts/run_fixtures.py fixtures -- target/release/sessions 2>&1 | tail -1

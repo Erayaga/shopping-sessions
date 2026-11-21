@@ -171,6 +171,12 @@ impl<T: Copy> Seg<T> {
     }
 
     #[allow(dead_code)]
+    /// Records pushed so far, staged ones included: the index the next push gets.
+    #[inline(always)]
+    pub fn count(&self) -> usize {
+        self.len() + self.nstage
+    }
+
     pub fn len(&self) -> usize {
         if self.blocks.is_empty() {
             0

@@ -12,7 +12,7 @@ export PATH="$PATH:/c/Program Files/Docker/Docker/resources/bin"
 cd "$(dirname "$0")/.."
 ROOT=$(pwd -W 2>/dev/null || pwd)
 IMG=rust:1-bookworm
-RUN="docker run --rm -v $ROOT:/w -v sessions-target:/w/target -v sessions-cargo:/usr/local/cargo/registry -w /w -e RUSTFLAGS=-Ctarget-cpu=x86-64-v3"
+RUN="docker run --rm --ulimit core=0 -v $ROOT:/w -v sessions-target:/w/target -v sessions-cargo:/usr/local/cargo/registry -w /w -e RUSTFLAGS=-Ctarget-cpu=x86-64-v3"
 case "$1" in
   build) $RUN $IMG cargo build --release ;;
   test) $RUN $IMG cargo test --release ;;
@@ -24,6 +24,6 @@ case "$1" in
     done; rm -f /tmp/fx.$$
     echo "$((n-fail))/$n fixtures passed" ;;
   run) shift; $RUN -v "$(cd "$1" && (pwd -W 2>/dev/null || pwd))":/data:ro -e DATA_DIR=/data -e OUTPUT_DIR=/w/$2 -e OUT_FORMAT="${OUT_FORMAT:-parquet}" -e NCPU="${NCPU:-8}" $IMG bash -c "rm -rf /w/$2 && time target/release/sessions" ;;
-  gen) shift; docker run --rm -v "$ROOT/../shopping-sessions-files/generator/generator:/g" -v sessions-gentarget:/g/target -v sessions-cargo:/usr/local/cargo/registry -v "$ROOT:/w" -w /g $IMG sh -c "cargo build --release -q && target/release/generate --seed $1 --events $2 --clicks $3 --output /w/$4" ;;
+  gen) shift; docker run --rm --ulimit core=0 -v "$ROOT/../shopping-sessions-files/generator/generator:/g" -v sessions-gentarget:/g/target -v sessions-cargo:/usr/local/cargo/registry -v "$ROOT:/w" -w /g $IMG sh -c "cargo build --release -q && target/release/generate --seed $1 --events $2 --clicks $3 --output /w/$4" ;;
   *) echo "unknown command"; exit 2 ;;
 esac
