@@ -11,7 +11,7 @@ export MSYS_NO_PATHCONV=1 MSYS2_ARG_CONV_EXCL="*"
 export PATH="$PATH:/c/Program Files/Docker/Docker/resources/bin"
 cd "$(dirname "$0")/.."
 ROOT=$(pwd -W 2>/dev/null || pwd)
-IMG=rust:1-bookworm
+IMG=rust:1.100.0-bookworm
 RUN="docker run --rm --ulimit core=0 -v $ROOT:/w -v sessions-target:/w/target -v sessions-cargo:/usr/local/cargo/registry -w /w -e RUSTFLAGS=-Ctarget-cpu=x86-64-v3"
 case "$1" in
   build) $RUN $IMG cargo build --release ;;

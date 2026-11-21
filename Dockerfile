@@ -1,5 +1,6 @@
 # Shopping Sessions: native Rust pipeline.
-FROM rust:1-slim-bookworm AS build
+# Pinned compiler, so the scorer builds exactly what was tested.
+FROM rust:1.100.0-slim-bookworm AS build
 WORKDIR /src
 # Scorers are Intel Xeon Cascade Lake or newer: AVX2 (x86-64-v3) is safe.
 ENV RUSTFLAGS="-C target-cpu=x86-64-v3"
