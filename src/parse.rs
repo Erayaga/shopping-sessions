@@ -187,6 +187,33 @@ pub fn civil_from_days(z: i64) -> (i64, i64, i64) {
     (yoe + era * 400 + i64::from(m <= 2), m, d)
 }
 
+const TABLE_Y0: i64 = 1900;
+const TABLE_YEARS: i64 = 300;
+/// (days since epoch of the 1st, days in the month) for 1900-01 .. 2199-12.
+static MONTHS: [(i32, u8); (TABLE_YEARS * 12) as usize] = {
+    let mut t = [(0i32, 0u8); (TABLE_YEARS * 12) as usize];
+    let mut i = 0;
+    while i < t.len() {
+        let y = TABLE_Y0 + (i / 12) as i64;
+        let m = (i % 12) as i64 + 1;
+        // days_from_civil(y, m, 1), written out for const evaluation
+        let yy = if m <= 2 { y - 1 } else { y };
+        let era = yy.div_euclid(400);
+        let yoe = yy - era * 400;
+        let doy = (153 * ((m + 9) % 12) + 2) / 5;
+        let start = era * 146_097 + yoe * 365 + yoe / 4 - yoe / 100 + doy - 719_468;
+        let leap = y % 4 == 0 && (y % 100 != 0 || y % 400 == 0);
+        let dim = match m {
+            2 => if leap { 29 } else { 28 },
+            4 | 6 | 9 | 11 => 30,
+            _ => 31,
+        };
+        t[i] = (start as i32, dim);
+        i += 1;
+    }
+    t
+};
+
 #[inline(always)]
 fn days_in_month(y: i64, m: i64) -> i64 {
     match m {
@@ -214,7 +241,17 @@ fn datetime(b: &[u8]) -> Option<i64> {
     let h = two(b, 11)?;
     let mi = two(b, 14)?;
     let s = two(b, 17)?;
-    if !(1..=12).contains(&mo) || d < 1 || d > days_in_month(y, mo) || h > 23 || mi > 59 || s > 59 {
+    if !(1..=12).contains(&mo) || h > 23 || mi > 59 || s > 59 || d < 1 {
+        return None;
+    }
+    if (TABLE_Y0..TABLE_Y0 + TABLE_YEARS).contains(&y) {
+        let (start, dim) = MONTHS[((y - TABLE_Y0) * 12 + mo - 1) as usize];
+        if d > dim as i64 {
+            return None;
+        }
+        return Some((((start as i64 + d - 1) * 24 + h) * 60 + mi) * 60_000 + s * SECOND);
+    }
+    if d > days_in_month(y, mo) {
         return None;
     }
     Some(((days_from_civil(y, mo, d) * 24 + h) * 60 + mi) * 60_000 + s * SECOND)
@@ -316,6 +353,20 @@ mod tests {
         }
         assert!(timestamp(b"2028-02-29T00:00:00Z").is_some());
         assert_eq!(timestamp(b"123456789012345678901"), Some(i64::MAX));
+    }
+
+    #[test]
+    fn month_table_matches_formula() {
+        for y in [1899i64, 1900, 1970, 2000, 2024, 2025, 2028, 2100, 2199, 2200, 9999] {
+            for m in 1..=12 {
+                for d in 1..=31 {
+                    let s = format!("{y:04}-{m:02}-{d:02}T12:34:56Z");
+                    let want = (d <= days_in_month(y, m))
+                        .then(|| ((days_from_civil(y, m, d) * 24 + 12) * 60 + 34) * 60_000 + 56_000);
+                    assert_eq!(timestamp(s.as_bytes()), want, "{s}");
+                }
+            }
+        }
     }
 
     #[test]
