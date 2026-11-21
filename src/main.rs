@@ -198,6 +198,18 @@ fn add_files(maps: &mut Vec<Mmap>, bases: &mut Vec<u64>, next: &mut u64, paths: 
     (chunks, total)
 }
 
+/// Starts reading a chunk's pages in the background (cold page cache).
+#[inline]
+fn read_ahead(corpus: &Corpus, c: Chunk) {
+    #[cfg(unix)]
+    {
+        let m = &corpus.maps[c.file as usize];
+        let _ = m.advise_range(memmap2::Advice::WillNeed, c.start, (c.end - c.start + LOOKAHEAD_PAD).min(m.len() - c.start));
+    }
+}
+const LOOKAHEAD: usize = 16;
+const LOOKAHEAD_PAD: usize = 4096;
+
 /// The lines a chunk owns: those starting in [c.start, c.end), except the
 /// file's first line (its header).
 #[inline]
@@ -496,12 +508,13 @@ fn main() {
     let corpus: &'static Corpus = Box::leak(Box::new(Corpus { maps, bases }));
     // Ask the kernel to read every input file ahead, from a side thread, so a
     // cold page cache streams at full disk speed while parsing runs.
+    // (Workers then keep LOOKAHEAD chunks in flight ahead of themselves.)
     #[cfg(unix)]
-    std::thread::spawn(move || {
-        for m in &corpus.maps {
-            let _ = m.advise(memmap2::Advice::WillNeed);
+    {
+        for c in link_chunks.iter().take(LOOKAHEAD).chain(event_chunks.iter().take(LOOKAHEAD)) {
+            read_ahead(corpus, *c);
         }
-    });
+    }
     lap("mapped");
 
     // Links don't feed parsing (people are resolved after it), so they run
@@ -515,6 +528,9 @@ fn main() {
             link_chunks.len(),
             || (buckets::<(u64, u64, u64, u32)>(est * 2), 0u32),
             |(bk, nedges), i| {
+                if let Some(&a) = link_chunks.get(i + LOOKAHEAD) {
+                    read_ahead(corpus, a);
+                }
                 let c = link_chunks[i];
                 let data: &[u8] = &corpus.maps[c.file as usize];
                 let lr = line_range(data, c);
@@ -658,6 +674,12 @@ fn main() {
             ne_chunks + click_chunks.len(),
             || (Parts::<ERec>::new(NB), Parts::<DRec>::new(NB), tids.fetch_add(1, Ordering::Relaxed) as u32, Parts::<Ck>::new(NB)),
             |(uk, dk, tid, bk), i| {
+                let ahead = i + LOOKAHEAD;
+                if ahead < ne_chunks {
+                    read_ahead(corpus, event_chunks[ahead]);
+                } else if let Some(&a) = click_chunks.get(ahead - ne_chunks) {
+                    read_ahead(corpus, a);
+                }
                 if i >= ne_chunks {
                     let c = click_chunks[i - ne_chunks];
                     let data: &[u8] = &corpus.maps[c.file as usize];
