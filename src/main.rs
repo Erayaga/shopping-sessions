@@ -75,6 +75,13 @@ impl<V: Copy + Default> Table<V> {
         Table { slots: vec![(0, V::default()); cap], mask: cap - 1 }
     }
     #[inline(always)]
+    pub fn prefetch(&self, k: u64) {
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            std::arch::x86_64::_mm_prefetch(&self.slots[(k as usize) & self.mask] as *const _ as *const i8, std::arch::x86_64::_MM_HINT_T0);
+        }
+    }
+    #[inline(always)]
     pub fn get(&self, k: u64) -> Option<V> {
         let mut i = (k as usize) & self.mask;
         loop {
@@ -719,20 +726,34 @@ fn main() {
         |(eo, co, seen), b| {
             let tab = &people[b];
             seen.clear();
-            for e in gather(&ep_valid, b) {
-                let k = (e.eh >> 20) & bloom_mask;
-                if bloom[(k >> 6) as usize] & (1 << (k & 63)) != 0 {
-                    if let Some(min) = dup_tabs[bucket(e.eh)].get(e.eh) {
-                        if e.ingest != min {
-                            continue;
+            // Duplicate-table lookups miss the cache: D records ahead, check the
+            // filter and prefetch the slot of likely duplicates.
+            const D: usize = 16;
+            for part in &ep_valid {
+                for sl in part.segs[b].slices() {
+                    for i in 0..sl.len() {
+                        if let Some(a) = sl.get(i + D) {
+                            let k = (a.eh >> 20) & bloom_mask;
+                            if bloom[(k >> 6) as usize] & (1 << (k & 63)) != 0 {
+                                dup_tabs[bucket(a.eh)].prefetch(a.eh);
+                            }
                         }
-                        if !seen.insert(e.eh) {
-                            continue;
+                        let e = &sl[i];
+                        let k = (e.eh >> 20) & bloom_mask;
+                        if bloom[(k >> 6) as usize] & (1 << (k & 63)) != 0 {
+                            if let Some(min) = dup_tabs[bucket(e.eh)].get(e.eh) {
+                                if e.ingest != min {
+                                    continue;
+                                }
+                                if !seen.insert(e.eh) {
+                                    continue;
+                                }
+                            }
                         }
+                        let (key, r) = tab.get(e.uh).unwrap_or((e.uh, e.uref));
+                        eo.push(bucket(key), Ev { key, r, ts: e.ts, pc: e.pc });
                     }
                 }
-                let (key, r) = tab.get(e.uh).unwrap_or((e.uh, e.uref));
-                eo.push(bucket(key), Ev { key, r, ts: e.ts, pc: e.pc });
             }
             for c in gather(&cp, b) {
                 let key = tab.get(c.key).map_or(c.key, |x| x.0);
@@ -764,32 +785,15 @@ fn main() {
             runs: Vec::new(),
             run_of: Vec::new(),
             by_camp: Vec::new(),
-            eg: Vec::new(),
-            cg: Vec::new(),
+            ltab: Vec::new(),
+            cnt: Vec::new(),
+            idx: Vec::new(),
+            es: Vec::new(),
+            cs: Vec::new(),
+            ccnt: Vec::new(),
         },
         |w, b| {
-            // Second-level groups by person hash, so each sort runs in cache.
-            if w.eg.is_empty() {
-                w.eg = (0..256).map(|_| Vec::new()).collect();
-                w.cg = (0..256).map(|_| Vec::new()).collect();
-            }
-            for e in gather(&ev_parts, b) {
-                w.eg[((e.key >> 48) & 255) as usize].push(*e);
-            }
-            for c in gather(&ck_parts, b) {
-                w.cg[((c.key >> 48) & 255) as usize].push(*c);
-            }
-            for g in 0..256 {
-                let mut evs = std::mem::take(&mut w.eg[g]);
-                let mut cks = std::mem::take(&mut w.cg[g]);
-                if !evs.is_empty() {
-                    w.group(&mut evs, &mut cks, &ctx, corpus);
-                }
-                evs.clear();
-                cks.clear();
-                w.eg[g] = evs;
-                w.cg[g] = cks;
-            }
+            w.bucket(&ev_parts, &ck_parts, b, &ctx, corpus);
         },
     );
     drop(ev_parts);
@@ -827,6 +831,20 @@ fn main() {
     lap(&format!("wrote {nrows} user rows, {} campaign rows", crows.len()));
 }
 
+#[inline]
+fn insertion_sort_by_key<T: Copy, K: Ord>(v: &mut [T], key: impl Fn(&T) -> K) {
+    for i in 1..v.len() {
+        let x = v[i];
+        let kx = key(&x);
+        let mut j = i;
+        while j > 0 && key(&v[j - 1]) > kx {
+            v[j] = v[j - 1];
+            j -= 1;
+        }
+        v[j] = x;
+    }
+}
+
 struct PCtx {
     t0: i64,
     day0: i64,
@@ -847,38 +865,150 @@ struct Worker {
     runs: Vec<(u32, i32)>, // (first session index, day)
     run_of: Vec<u32>,
     by_camp: Vec<(u32, u32)>,
-    eg: Vec<Vec<Ev>>,
-    cg: Vec<Vec<Ck>>,
+    ltab: Vec<(u64, u32)>, // person hash -> local index
+    cnt: Vec<u32>,         // events per local person, then their start offsets
+    idx: Vec<u32>,         // local person of each event / click, in input order
+    es: Vec<Ev>,           // events laid out by person
+    cs: Vec<Ck>,           // clicks laid out by person
+    ccnt: Vec<u32>,        // clicks per local person, then start offsets
 }
 
 impl Worker {
-    fn group(&mut self, evs: &mut [Ev], cks: &mut [Ck], ctx: &PCtx, corpus: &Corpus) {
-        evs.sort_unstable_by_key(|e| (e.key, e.ts));
-        cks.sort_unstable_by(|a, c| {
-            a.key
-                .cmp(&c.key)
-                .then(a.ts.cmp(&c.ts))
-                .then_with(|| corpus.bytes(c.cid).cmp(corpus.bytes(a.cid)))
-        });
-        let mut ci = 0;
-        let mut i = 0;
-        while i < evs.len() {
-            let p = evs[i].key;
-            let mut j = i + 1;
-            while j < evs.len() && evs[j].key == p {
-                j += 1;
-            }
-            while ci < cks.len() && cks[ci].key < p {
-                ci += 1;
-            }
-            let mut cj = ci;
-            while cj < cks.len() && cks[cj].key == p {
-                cj += 1;
-            }
-            self.person(&evs[i..j], &cks[ci..cj], ctx);
-            ci = cj;
-            i = j;
+    /// One person bucket: a local table numbers the persons, counts give each
+    /// one a contiguous range, a single scatter fills it, and only each
+    /// person's own events are then sorted by time.
+    fn bucket(&mut self, ev_parts: &[Parts<Ev>], ck_parts: &[Parts<Ck>], b: usize, ctx: &PCtx, corpus: &Corpus) {
+        let ne: usize = ev_parts.iter().map(|p| p.segs[b].len()).sum();
+        if ne == 0 {
+            return;
         }
+        // Sized for ~4 events per person (they average far more); grows if needed.
+        let mut cap = (ne / 2).next_power_of_two().max(64);
+        let mut mask = cap - 1;
+        let mut ltab = std::mem::take(&mut self.ltab);
+        ltab.clear();
+        ltab.resize(cap, (0, 0));
+        let mut cnt = std::mem::take(&mut self.cnt);
+        cnt.clear();
+        let mut idx = std::mem::take(&mut self.idx);
+        idx.clear();
+        for e in gather(ev_parts, b) {
+            let mut i = (e.key as usize) & mask;
+            let li = loop {
+                let s = ltab[i];
+                if s.0 == e.key {
+                    break s.1;
+                }
+                if s.0 == 0 {
+                    let li = cnt.len() as u32;
+                    ltab[i] = (e.key, li);
+                    cnt.push(0);
+                    break li;
+                }
+                i = (i + 1) & mask;
+            };
+            cnt[li as usize] += 1;
+            idx.push(li);
+            if cnt.len() * 4 > cap * 3 {
+                // rehash into a table twice the size
+                cap *= 2;
+                mask = cap - 1;
+                let old = std::mem::replace(&mut ltab, vec![(0, 0); cap]);
+                for s in old.into_iter().filter(|s| s.0 != 0) {
+                    let mut i = (s.0 as usize) & mask;
+                    while ltab[i].0 != 0 {
+                        i = (i + 1) & mask;
+                    }
+                    ltab[i] = s;
+                }
+            }
+        }
+        let np = cnt.len();
+        // counts -> start offsets (cnt[np] = total)
+        let mut acc = 0u32;
+        for c in cnt.iter_mut() {
+            let n = *c;
+            *c = acc;
+            acc += n;
+        }
+        cnt.push(acc);
+        let mut es = std::mem::take(&mut self.es);
+        es.clear();
+        es.reserve(ne);
+        unsafe { es.set_len(ne) };
+        {
+            let mut pos: Vec<u32> = cnt[..np].to_vec();
+            for (j, e) in gather(ev_parts, b).enumerate() {
+                let li = idx[j] as usize;
+                es[pos[li] as usize] = *e;
+                pos[li] += 1;
+            }
+        }
+        // clicks of persons with events (others can credit nothing)
+        let mut ccnt = std::mem::take(&mut self.ccnt);
+        ccnt.clear();
+        ccnt.resize(np + 1, 0);
+        idx.clear();
+        for c in gather(ck_parts, b) {
+            let mut i = (c.key as usize) & mask;
+            let li = loop {
+                let s = ltab[i];
+                if s.0 == c.key {
+                    break s.1;
+                }
+                if s.0 == 0 {
+                    break u32::MAX;
+                }
+                i = (i + 1) & mask;
+            };
+            if li != u32::MAX {
+                ccnt[li as usize] += 1;
+            }
+            idx.push(li);
+        }
+        let mut acc = 0u32;
+        for c in ccnt.iter_mut() {
+            let n = *c;
+            *c = acc;
+            acc += n;
+        }
+        let nc = acc as usize;
+        let mut cs = std::mem::take(&mut self.cs);
+        cs.clear();
+        cs.reserve(nc);
+        unsafe { cs.set_len(nc) };
+        {
+            let mut pos: Vec<u32> = ccnt[..np].to_vec();
+            for (j, c) in gather(ck_parts, b).enumerate() {
+                let li = idx[j];
+                if li != u32::MAX {
+                    cs[pos[li as usize] as usize] = *c;
+                    pos[li as usize] += 1;
+                }
+            }
+        }
+        for p in 0..np {
+            let ev = &mut es[cnt[p] as usize..cnt[p + 1] as usize];
+            if ev.len() > 1 {
+                if ev.len() <= 16 {
+                    insertion_sort_by_key(ev, |e| e.ts);
+                } else {
+                    ev.sort_unstable_by_key(|e| e.ts);
+                }
+            }
+            let ck = &mut cs[ccnt[p] as usize..ccnt[p + 1] as usize];
+            if ck.len() > 1 {
+                ck.sort_unstable_by(|a, c| a.ts.cmp(&c.ts).then_with(|| corpus.bytes(c.cid).cmp(corpus.bytes(a.cid))));
+            }
+            let (ev, ck) = (&es[cnt[p] as usize..cnt[p + 1] as usize], &cs[ccnt[p] as usize..ccnt[p + 1] as usize]);
+            self.person(ev, ck, ctx);
+        }
+        self.ltab = ltab;
+        self.cnt = cnt;
+        self.idx = idx;
+        self.es = es;
+        self.cs = cs;
+        self.ccnt = ccnt;
     }
 
     fn flush_day(&mut self, name: u64, day: i32, sessions: u32, events: u32, revenue: u64) {
