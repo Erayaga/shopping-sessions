@@ -5,3 +5,5 @@ out*/
 ref-*/
 fx-out/
 __pycache__/
+pin-log.txt
+*.log
