@@ -867,6 +867,8 @@ fn main() {
             es: Vec::new(),
             cs: Vec::new(),
             ccnt: Vec::new(),
+            pnames: Vec::new(),
+            pkeys: Vec::new(),
         },
         |w, b| {
             w.bucket(&ev_parts, &ck_parts, &nm_parts, b, &ctx, corpus);
@@ -956,6 +958,8 @@ struct Worker {
     es: Vec<Ev>,           // events laid out by person
     cs: Vec<Ck>,           // clicks laid out by person
     ccnt: Vec<u32>,        // clicks per local person, then start offsets
+    pnames: Vec<u64>,      // name ref per local person
+    pkeys: Vec<u64>,       // person hash per local person
 }
 
 impl Worker {
@@ -975,21 +979,39 @@ impl Worker {
         if ne == 0 {
             return;
         }
-        let mut names: Table<u64> = Table::with_capacity(part_len(nm_parts, b));
-        for &(k, r) in gather(nm_parts, b) {
-            names.insert(k, r);
-        }
-        // Sized for ~4 events per person (they average far more); grows if
-        // needed. Kept between buckets and reset by its used slots only.
-        let want = (ne / 2).next_power_of_two().max(64);
+        // Persons are numbered from the name side stream (every person with
+        // events here has an entry, possibly repeated), so the table is sized
+        // exactly and each local index has its name; events then only probe.
+        let nn = part_len(nm_parts, b);
+        let want = (nn * 2).next_power_of_two().max(64);
         let mut ltab = std::mem::take(&mut self.ltab);
-        if ltab.len() < want {
+        if ltab.len() < want || ltab.len() > want * 4 {
             ltab = vec![(0, 0); want];
         }
-        let mut cap = ltab.len();
-        let mut mask = cap - 1;
+        let mask = ltab.len() - 1;
         let mut cnt = std::mem::take(&mut self.cnt);
         cnt.clear();
+        let mut pnames = std::mem::take(&mut self.pnames);
+        pnames.clear();
+        let mut pkeys = std::mem::take(&mut self.pkeys);
+        pkeys.clear();
+        for &(k, r) in gather(nm_parts, b) {
+            let mut i = (k as usize) & mask;
+            loop {
+                let s = ltab[i];
+                if s.0 == k {
+                    break;
+                }
+                if s.0 == 0 {
+                    ltab[i] = (k, cnt.len() as u32);
+                    cnt.push(0);
+                    pnames.push(r);
+                    pkeys.push(k);
+                    break;
+                }
+                i = (i + 1) & mask;
+            }
+        }
         let mut idx = std::mem::take(&mut self.idx);
         idx.clear();
         for e in gather(ev_parts, b) {
@@ -999,29 +1021,11 @@ impl Worker {
                 if s.0 == e.key {
                     break s.1;
                 }
-                if s.0 == 0 {
-                    let li = cnt.len() as u32;
-                    ltab[i] = (e.key, li);
-                    cnt.push(0);
-                    break li;
-                }
+                debug_assert!(s.0 != 0, "event of a person without a name");
                 i = (i + 1) & mask;
             };
             cnt[li as usize] += 1;
             idx.push(li);
-            if cnt.len() * 4 > cap * 3 {
-                // rehash into a table twice the size
-                cap *= 2;
-                mask = cap - 1;
-                let old = std::mem::replace(&mut ltab, vec![(0, 0); cap]);
-                for s in old.into_iter().filter(|s| s.0 != 0) {
-                    let mut i = (s.0 as usize) & mask;
-                    while ltab[i].0 != 0 {
-                        i = (i + 1) & mask;
-                    }
-                    ltab[i] = s;
-                }
-            }
         }
         let np = cnt.len();
         // counts -> start offsets (cnt[np] = total)
@@ -1101,18 +1105,20 @@ impl Worker {
                 ck.sort_unstable_by(|a, c| a.ts.cmp(&c.ts).then_with(|| corpus.bytes(c.cid).cmp(corpus.bytes(a.cid))));
             }
             let (ev, ck) = (&es[cnt[p] as usize..cnt[p + 1] as usize], &cs[ccnt[p] as usize..ccnt[p + 1] as usize]);
-            let name = names.get(ev[0].key).expect("every person has a name");
-            self.person(name, ev, ck, ctx);
+            if !ev.is_empty() {
+                self.person(pnames[p], ev, ck, ctx);
+            }
         }
         // reset the used slots: each person's key is still in its slot
-        for p in 0..np {
-            let k = es[cnt[p] as usize].key;
+        for &k in &pkeys {
             let mut i = (k as usize) & mask;
             while ltab[i].0 != k {
                 i = (i + 1) & mask;
             }
             ltab[i].0 = 0;
         }
+        self.pnames = pnames;
+        self.pkeys = pkeys;
         self.ltab = ltab;
         self.cnt = cnt;
         self.idx = idx;
