@@ -627,11 +627,31 @@ fn main() {
         // ================================================================ events: parse
         // Valid copies go to their user_id bucket in full; every copy also sends
         // (event_id hash, ingest) to its event_id bucket for duplicate detection.
+        // Events and clicks in one pass (no barrier between them): indices
+        // past the event chunks are click chunks.
+        let ne_chunks = event_chunks.len();
         let ep = par_fin(
             threads,
-            event_chunks.len(),
-            || (Parts::<ERec>::new(NB), Parts::<DRec>::new(NB), tids.fetch_add(1, Ordering::Relaxed) as u32),
-            |(uk, dk, tid), i| {
+            ne_chunks + click_chunks.len(),
+            || (Parts::<ERec>::new(NB), Parts::<DRec>::new(NB), tids.fetch_add(1, Ordering::Relaxed) as u32, Parts::<Ck>::new(NB)),
+            |(uk, dk, tid, bk), i| {
+                if i >= ne_chunks {
+                    let c = click_chunks[i - ne_chunks];
+                    let data: &[u8] = &corpus.maps[c.file as usize];
+                    parse::for_rows::<4>(data, c.start, c.end, |f| {
+                        if f[0].is_empty() || f[1].is_empty() || f[2].is_empty() {
+                            return;
+                        }
+                        let Some(camp) = camp_tab.get(hash(f[2])) else { return };
+                        let Some(ts) = parse::timestamp(f[3]) else { return };
+                        if ts < t0 || ts >= we {
+                            return;
+                        }
+                        let uh = hash(f[1]);
+                        bk.push(bucket(uh), Ck { key: uh, cid: corpus.rf(c.file, f[0]), ts: (ts - t0) as u32, camp });
+                    });
+                    return;
+                }
                 let c = event_chunks[i];
                 let data: &[u8] = &corpus.maps[c.file as usize];
                 parse::for_rows::<7>(data, c.start, c.end, |f| {
@@ -674,41 +694,24 @@ fn main() {
                     dk.push(bucket(eh), DRec { eh, ingest, loc });
                 });
             },
-            |(uk, dk, _)| {
+            |(uk, dk, _, bk)| {
                 uk.finish();
                 dk.finish();
+                bk.finish();
             },
         );
         // Locations name the producing thread by its id: order outputs by it.
         let mut ep = ep;
         ep.sort_unstable_by_key(|x| x.2);
-        let (ep_valid, ep_ids): (Vec<_>, Vec<_>) = ep.into_iter().map(|(u, d, _)| (u, d)).unzip();
-        lap("events parsed");
-
-        // ================================================================ clicks: parse
-        let cp = par_fin(
-            threads,
-            click_chunks.len(),
-            || Parts::<Ck>::new(NB),
-            |bk, i| {
-                let c = click_chunks[i];
-                let data: &[u8] = &corpus.maps[c.file as usize];
-                parse::for_rows::<4>(data, c.start, c.end, |f| {
-                    if f[0].is_empty() || f[1].is_empty() || f[2].is_empty() {
-                        return;
-                    }
-                    let Some(camp) = camp_tab.get(hash(f[2])) else { return };
-                    let Some(ts) = parse::timestamp(f[3]) else { return };
-                    if ts < t0 || ts >= we {
-                        return;
-                    }
-                    let uh = hash(f[1]);
-                    bk.push(bucket(uh), Ck { key: uh, cid: corpus.rf(c.file, f[0]), ts: (ts - t0) as u32, camp });
-                });
-            },
-            |bk| bk.finish(),
-        );
-        lap("clicks parsed");
+        let mut ep_valid = Vec::new();
+        let mut ep_ids = Vec::new();
+        let mut cp = Vec::new();
+        for (u, d, _, c) in ep {
+            ep_valid.push(u);
+            ep_ids.push(d);
+            cp.push(c);
+        }
+        lap("events and clicks parsed");
         (links.join().unwrap(), ep_valid, ep_ids, cp)
     });
 

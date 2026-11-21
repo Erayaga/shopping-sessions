@@ -47,6 +47,7 @@ pub fn split<'a, const N: usize>(line: &'a [u8], out: &mut [&'a [u8]; N]) -> boo
 /// Comma, newline and quote bitmasks of the 128 bytes at p.
 #[cfg(target_feature = "avx2")]
 #[inline(always)]
+#[allow(dead_code)] // reference for tests
 unsafe fn masks128(p: *const u8) -> (u128, u128, u128) {
     use std::arch::x86_64::*;
     let comma = _mm256_set1_epi8(b',' as i8);
@@ -67,6 +68,7 @@ unsafe fn masks128(p: *const u8) -> (u128, u128, u128) {
 
 #[cfg(not(target_feature = "avx2"))]
 #[inline(always)]
+#[allow(dead_code)]
 unsafe fn masks128(p: *const u8) -> (u128, u128, u128) {
     let (mut c, mut n, mut q) = (0u128, 0u128, 0u128);
     for i in 0..128 {
@@ -83,6 +85,7 @@ unsafe fn masks128(p: *const u8) -> (u128, u128, u128) {
 
 /// Bits a..b (b exclusive, b <= 127).
 #[inline(always)]
+#[allow(dead_code)] // reference for tests
 fn range(a: usize, b: usize) -> u128 {
     ((1u128 << b) - 1) & !((1u128 << a) - 1)
 }
@@ -91,6 +94,7 @@ fn range(a: usize, b: usize) -> u128 {
 /// `end`). Returns where the next line starts and whether `out` holds a
 /// well-formed row. Same rules as `split`.
 #[inline(always)]
+#[allow(dead_code)] // reference for tests
 pub fn next_line<'a, const N: usize>(data: &'a [u8], start: usize, end: usize, out: &mut [&'a [u8]; N]) -> (usize, bool) {
     if start + 128 <= data.len() {
         let (cm, nm, qm) = unsafe { masks128(data.as_ptr().add(start)) };
@@ -140,6 +144,7 @@ pub fn next_line<'a, const N: usize>(data: &'a [u8], start: usize, end: usize, o
 
 /// Calls f for every well-formed row among the lines in data[start..end].
 #[inline(always)]
+#[allow(dead_code)] // reference for tests
 pub fn for_rows_ref<'a, const N: usize>(data: &'a [u8], start: usize, end: usize, mut f: impl FnMut(&[&'a [u8]; N])) {
     let mut out: [&'a [u8]; N] = [&data[..0]; N];
     let mut p = start;
@@ -718,7 +723,7 @@ pub fn for_rows<'a, const N: usize>(data: &'a [u8], start: usize, end: usize, mu
         }
     };
     let mut base = start;
-    let mut buf = [0u8; 64];
+    let mut buf: [u8; 64];
     while base < end {
         let (mut cm, mut nm, mut qm) = if base + 64 <= data.len() {
             unsafe { masks64(data.as_ptr().add(base)) }
